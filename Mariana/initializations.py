@@ -1,217 +1,225 @@
+import Mariana.settings as MSET
+import Mariana.useful as MUSE
+import Mariana.abstraction as MABS
+import Mariana.activations as MA
+
+import lasagne.init as LI
+
 import numpy
 import theano
 import theano.tensor as tt
-import Mariana.settings as MSET
-from Mariana.abstraction import Abstraction_ABC
 
 __all__= [
     "Initialization_ABC",
-    "HardSet",
     "Identity",
-    "GlorotTanhInit",
-    "Uniform",
-    "UniformWeights",
-    "UniformEmbeddings",
-    "SmallUniform",
-    "SmallUniformWeights",
-    "SmallUniformEmbeddings",
-    "Normal",
-    "NormalWeights",
+    "HardSet",
     "SingleValue",
-    "SingleValueWeights",
-    "SingleValueBias",
-    "ZeroWeights",
-    "ZeroBias"
+    "Normal",
+    "Uniform",
+    "FanInFanOut_ABC",
+    "GlorotNormal",
+    "GlorotUniform",
+    "HeNormal",
+    "HeUniform",
 ]
 
-class Initialization_ABC(Abstraction_ABC) :
-    """This class defines the interface that an Initialization must offer. As a general good practice every init should only take care of a single
-    parameter, but you are free to do whatever you want.
+class Initialization_ABC(MABS.UntrainableAbstraction_ABC, MABS.Apply_ABC) :
+    """This class defines the interface that an Initialization must offer.
+    
+    :param string parameter: the name of the parameter to be initialized
+    :param float parameter: how sparse should the result be. 0 => no sparsity, 1 => a matrix of zeros
     """
 
-    def __call__(self, *args, **kwargs) :
-        self.initialize(*args, **kwargs)
-
-    def apply(self, layer) :
-        hyps = {}
-        for k in self.hyperParameters :
-            hyps[k] = getattr(self, k)
-
-        message = "%s was initialized using %s" % (layer.name, self.__class__.__name__)
-        try :
-            self.initialize(layer)
-        except Exception as e:
-            message = "%s was *NOT* initialized using %s. Because: %s" % (layer.name, self.__class__.__name__, e.message)
-            layer.network.logLayerEvent(layer, message, hyps)
-            raise e
+    def __init__(self, parameter, sparsity=0., **kwargs):
+        super(Initialization_ABC, self).__init__(**kwargs)
         
-    def initialize(self, layer) :
+        self.addHyperParameters({
+            "parameter": parameter,
+            "sparsity": sparsity
+        })
+
+    # def _apply(self, abstraction, **kwargs) :
+    #     if not abstraction.hasP(self.getHP("parameter")) :
+    #         raise ValueError ("'%s' does not have a parameter '%s'" % (abstraction, self.getHP("parameter") ) )
+        
+    #     if not abstraction.getP(self.getHP("parameter")).isTied() :
+    #         super(Initialization_ABC, self)._apply(abstraction, **kwargs)
+            
+    def logApply(self, layer, **kwargs) :
+        message = "Applying '%s' on parameter: '%s' of layer '%s'" % (self.name, self.getHP('parameter'), layer.name)
+        self.logEvent(message)
+
+    def apply(self, abstraction, **kwargs) :
+        
+        retShape = abstraction._getParameterShape_abs(self.getHP("parameter"))
+        # print self
+        v = MUSE.iCast_numpy(self.run(retShape))
+        if (v.shape != retShape) :
+            raise ValueError("Initialization has a wrong shape: %s, parameter shape is: %s " % (v.shape, retShape))
+        
+        v = MUSE.sparsify(v, self.getHP("sparsity"))
+        v = numpy.asarray(v, dtype = theano.config.floatX)
+        # print self, v.dtype
+        abstraction.setP(self.getHP("parameter"), v)
+    
+    def run(self, shape) :
         """The function that all Initialization_ABCs must implement"""
         raise NotImplemented("This one should be implemented in child")
 
-class Identity(Initialization_ABC) :
-    """Identity matrix for weights"""
-    def __init__(self, *args, **kwargs) :
-        Initialization_ABC.__init__(self, *args, **kwargs)
+class Null(Initialization_ABC) :
+    """Return None, mainly for some cases of lasagne compatibility"""
+    def run(self, shape) :
+        return None
 
-    def initialize(self, layer) :
-        v = numpy.identity(layer.nbOutputs, dtype = theano.config.floatX)
-        layer.initParameter( "W",  theano.shared(value = v, name = "%s_%s" % (layer.name, "W") ) )
+class Identity(Initialization_ABC) :
+    """Identity matrix. Its your job to make sure that the parameter is a square matrix"""
+    def run(self, shape) :
+        sv = None
+        for s in shape :
+            if not sv :
+                sv = s
+            elif sv != s :
+                raise ValueError("Shape must be square, got: %s" % shape)
+
+        v = numpy.identity(shape, dtype = theano.config.floatX)
+        return v
 
 class HardSet(Initialization_ABC) :
-    """Sets the parameter to value (must have a correct shape)"""
-    def __init__(self, parameter, value, *args, **kwargs) :
-        Initialization_ABC.__init__(self, *args, **kwargs)
-        self.parameter = parameter
+    """Sets the parameter to value. It's your job to make sure that the shape is correct"""
+    def __init__(self, parameter, value, **kwargs) :
+        super(HardSet, self).__init__(**kwargs)
         self.value = numpy.asarray(value, dtype=theano.config.floatX)
-        self.hyperParameters = ["parameter"]
-
-    def initialize(self, layer) :
-        layer.initParameter( self.parameter, theano.shared(value = self.value, name = "%s_%s" % (layer.name, self.parameter) ) )
-
-class GlorotTanhInit(Initialization_ABC) :
-    """Set up the layer weights according to the tanh initialization introduced by Glorot et al. 2010"""
-    def __init__(self, *args, **kwargs) :
-        Initialization_ABC.__init__(self, *args, **kwargs)
-
-    def initialize(self, layer) :
-        shape = layer.getParameterShape("W")
-        rng = numpy.random.RandomState(MSET.RANDOM_SEED)
-
-        W = rng.uniform(
-                    low = -numpy.sqrt(6. / (layer.nbInputs + layer.nbOutputs)),
-                    high = numpy.sqrt(6. / (layer.nbInputs + layer.nbOutputs)),
-                    size = shape
-                )
-        layer.initParameter( "W", theano.shared(W) )
-
-class Uniform(Initialization_ABC) :
-    """Random values from a unifrom distribution (divided by the overall sum)."""
-    def __init__(self, parameter, *args, **kwargs) :
-        Initialization_ABC.__init__(self, *args, **kwargs)
-        self.parameter = parameter
-        self.hyperParameters = [parameter]
-
-    def initialize(self, layer) :
-        shape = layer.getParameterShape(self.parameter)
-        v = numpy.random.random(shape)
-        v = numpy.asarray(v, dtype=theano.config.floatX)
-        layer.initParameter( self.parameter,  theano.shared(value = v, name = "%s_%s" % (layer.name, self.parameter) ) )
-
-class UniformWeights(Uniform) :
-    """Small random weights from a unifrom distribution"""
-    def __init__(self, *args, **kwargs) :
-        Uniform.__init__(self, 'W', *args, **kwargs)
-        self.hyperParameters = []
-
-class UniformEmbeddings(Uniform) :
-    """Random embeddings from a unifrom distribution"""
-    def __init__(self, *args, **kwargs) :
-        Uniform.__init__(self, 'embeddings', *args, **kwargs)
-        self.hyperParameters = []
-
-class SmallUniform(Uniform) :
-    """Random values from a unifrom distribution (divided by the overall sum)."""
-    def initialize(self, layer) :
-        shape = layer.getParameterShape(self.parameter)
-        try :
-            v = numpy.random.random(shape)
-        except :
-            raise KeyError("Layer '%s' has weird shape: '%s'" % (layer.name, shape))
-
-        v /= sum(v)
-        v = numpy.asarray(v, dtype=theano.config.floatX)
-        layer.initParameter( self.parameter,  theano.shared(value = v, name = "%s_%s" % (layer.name, self.parameter)) )
-
-class SmallUniformWeights(SmallUniform) :
-    """Small random weights from a unifrom distribution (divided by the overall sum)"""
-    def __init__(self, *args, **kwargs) :
-        SmallUniform.__init__(self, 'W', *args, **kwargs)
-        self.hyperParameters = []
-
-class SmallUniformEmbeddings(SmallUniform) :
-    """Small random embeddings from a unifrom distribution (divided by the overall sum)"""
-    def __init__(self, *args, **kwargs) :
-        SmallUniform.__init__(self, 'embeddings', *args, **kwargs)
-        self.hyperParameters = []
-
-class ScaledVarianceWeights(Initialization_ABC):
-    """Scales the weights so that the variance is the same for every neurone."""
-    def __init__(self, *args, **kwargs):
-        self.parameter = "W"
-        super(UnitVariance, self).__init__(*args, **kwargs)
-    
-    def initialize(self, layer) :
-        shape = layer.getParameterShape(self.parameter)
-        w = numpy.random.randn(shape[0]) / numpy.sqrt(shape[0], dtype=theano.config.floatX)
-        layer.initParameter( "W",  theano.shared(value = w, name = "%s_%s" % (layer.name, "W") ) )
-
-class Normal(Initialization_ABC) :
-    """Random values from a normal distribution"""
-    def __init__(self, parameter, standardDev, *args, **kwargs) :
-        Initialization_ABC.__init__(self, *args, **kwargs)
-        self.parameter = parameter
-        self.standardDev = standardDev
-        self.hyperParameters = ["parameter", "standardDev"]
-
-    def initialize(self, layer) :
-        shape = layer.getParameterShape(self.parameter)
-        v = numpy.random.normal(0, self.standardDev, shape)
-        v = numpy.asarray(v, dtype=theano.config.floatX)
-        layer.initParameter( self.parameter,  theano.shared(value = v, name = "%s_%s" % (layer.name, self.parameter) ) )
-
-class NormalWeights(Normal) :
-    """Random weights from a normal distribution"""
-    def __init__(self, standardDev, *args, **kwargs) :
-        Normal.__init__(self, 'W', standardDev, *args, **kwargs)
-        self.standardDev = standardDev
-        self.hyperParameters = ["standardDev"]
-
-class HeWeights(Initialization_ABC) :
-    """Initialization proposed by He et al. for ReLU in *Delving Deep into Rectifiers: Surpassing Human-Level Performance on ImageNet Classification* """
-    def __init__(self, *args, **kwargs) :
-        super(HeWeights, self).__init__(*args, **kwargs)
-        self.parameter = "W"
-        self.hyperParameters = []
-
-    def initialize(self, layer) :
-        shape = layer.getParameterShape(self.parameter)
-        v = numpy.random.normal(0, numpy.sqrt(2./shape[0]), shape, dtype=theano.config.floatX)
-        layer.initParameter( self.parameter,  theano.shared(value = v, name = "%s_%s" % (layer.name, self.parameter) ) )
+        
+    def run(self, shape) :
+        return self.value
 
 class SingleValue(Initialization_ABC) :
     """Initialize to a given value"""
-    def __init__(self, parameter, value, *args, **kwargs) :
-        Initialization_ABC.__init__(self, *args, **kwargs)
-        self.parameter = parameter
-        self.value = value
-        self.hyperParameters = ["parameter", "value"]
+    def __init__(self, parameter, value, **kwargs) :
+        super(SingleValue, self).__init__(parameter, **kwargs)
+        self.setHP("value", value)
+    
+    def run(self, shape) :
+        return numpy.ones(shape) * self.getHP("value")
+        
+class Normal(Initialization_ABC):
+    """
+    Initializes using a random normal distribution.
+    **Small** uses my personal initialization than I find works very well in most cases with a uniform distribution, simply divides by the sum of the weights.
+    """
+    def __init__(self, parameter, mean=0, std=1, small=False, **kwargs):
+        super(Normal, self).__init__(parameter, **kwargs)
+        self.addHyperParameters({
+            "std": std,
+            "mean": mean,
+            "small": small
+        })
+    
+    def run(self, shape) :
+        v = numpy.random.normal(self.getHP("mean"), self.getHP("std"), size=shape)
+        if self.getHP("small") :
+            return v / numpy.sum(v)
+        return v
 
-    def initialize(self, layer) :
-        shape = layer.getParameterShape(self.parameter)
-        v = numpy.zeros( shape, dtype = theano.config.floatX) + self.value
-        layer.initParameter( self.parameter,  theano.shared(value = v, name = "%s_%s" % (layer.name, self.parameter) ) )
+class Uniform(Initialization_ABC):
+    """
+    Initializes using a uniform distribution
+    **Small** uses my personal initialization than I find can work very well, simply divides by the sum of the weights.
+    """
+    def __init__(self, parameter, low=0, high=1, small=False, **kwargs):
+        super(Uniform, self).__init__(parameter, **kwargs)
+        self.setHP("low", int(low))
+        self.setHP("high", int(high))
+        self.setHP("small", small)
+    
+    def run(self, shape) :
+        v = numpy.random.uniform(low=self.getHP("low"), high=self.getHP("high"), size=shape)
+        if self.getHP("small") :
+            return v / sum(v)
+        return v
 
-class SingleValueWeights(SingleValue) :
-    """Initialize the weights to a given value"""
-    def __init__(self, value, *args, **kwargs) :
-        SingleValue.__init__(self, 'W', value, *args, **kwargs)
-        self.hyperParameters = ["value"]
+class FanInFanOut_ABC(Initialization_ABC) :
+    """
+    Abtract class for fan_in/_out inits (Glorot and He)
+    Over the time people have introduced
+    ways to make it work with other various activation functions by modifying a gain factor.
+    You can force the gain using the *forceGain* argument, otherwise Mariana will choose
+    one for you depending on the abstraction's activation.
 
-class ZeroWeights(SingleValueWeights) :
-    """Initialize the weights to zero"""
-    def __init__(self, *args, **kwargs) :
-        SingleValueWeights.__init__(self, 0)
-        self.hyperParameters = []
+        * ReLU: sqrt(2)
+        
+        * LeakyReLU: sqrt(2/(1+alpha**2)) where alpha is the leakiness
 
-class SingleValueBias(SingleValue) :
-    """Initialize the bias to a given value"""
-    def __init__(self, value, *args, **kwargs) :
-        SingleValue.__init__(self, 'b', value, *args, **kwargs)
-        self.hyperParameters = ["value"]
+        * Everything else : 1.0
+    
+    This is an abtract class: see *GlorotNormal*, *GlorotUniform*
+    """
+    def __init__(self, parameter, forceGain=None, **kwargs) :
+        super(FanInFanOut_ABC, self).__init__(parameter, **kwargs)
+        self.setHP("forceGain", forceGain)
+        self.gain = None
 
-class ZeroBias(SingleValueBias) :
-    """Initialize the bias to zeros"""
-    def __init__(self, *args, **kwargs) :
-        SingleValueBias.__init__(self, 0)
-        self.hyperParameters = []
+    @classmethod
+    def _getGain(cls, activation) :
+        """returns the gain with respesct to an activation function"""
+        if activation.__class__ is MA.ReLU :
+            if activation.leakiness == 0 :
+                return numpy.sqrt(2)
+            else :
+                return numpy.sqrt(2/(1+activation.leakiness**2))
+        return 1.0
+
+    def setup(self, abstraction) :
+        self.gain = self._getGain(abstraction.abstractions["activation"])
+
+    def apply(self, abstraction) :
+        import Mariana.activations as MA
+
+        forceGain = self.getHP("forceGain")
+        if forceGain :
+            self.gain = forceGain
+        else :
+            self.gain = self._getGain(abstraction.abstractions["activation"])
+        
+        return super(FanInFanOut_ABC, self).apply(abstraction)
+
+class XNormal(FanInFanOut_ABC) :
+    """
+    Initialization strategy introduced by Glorot et al. 2010 on a Normal distribution.
+    Uses lasagne as backend.
+    """ 
+    def run(self, shape) :
+        return LI.GlorotNormal(gain = self.gain).sample(shape)
+
+XavierNormal = XNormal
+GlorotNormal = XNormal
+
+class XUniform(FanInFanOut_ABC) :
+    """
+    Initialization strategy introduced by Glorot et al. 2010 on a Uniform distribution.
+    If you use tanh() as activation try this one first.
+    Uses lasagne as backend.
+    """ 
+    def run(self, shape) :
+        return LI.GlorotUniform(gain = self.gain).sample(shape)
+
+XavierUniform = XUniform
+GlorotUniform = XUniform
+
+class HeNormal(FanInFanOut_ABC) :
+    """
+    Initialization proposed by He et al. for ReLU in *Delving Deep into Rectifiers: Surpassing Human-Level Performance on ImageNet Classification*, 2015.
+    
+    On a Normal distribution, Uses lasagne as backend.
+    """ 
+    def run(self, shape) :
+        return LI.HeNormal(gain = self.gain).sample(shape)
+
+class HeUniform(FanInFanOut_ABC) :
+    """
+    Initialization proposed by He et al. for ReLU in *Delving Deep into Rectifiers: Surpassing Human-Level Performance on ImageNet Classification*, 2015.
+    
+    On a Uniform distribution, Uses lasagne as backend.
+    """ 
+    def run(self, shape) :
+        return LI.HeUniform(gain = self.gain).sample(shape)

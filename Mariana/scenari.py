@@ -1,88 +1,328 @@
 import theano, numpy
 import theano.tensor as tt
-from Mariana.abstraction import Abstraction_ABC
+from collections import OrderedDict
+import lasagne.updates as LUP
 
-__all__ = ["LearningScenario_ABC", "Fixed", "GradientDescent", "MomentumGradientDescent"]
+import Mariana.abstraction as MABS
 
-class LearningScenario_ABC(Abstraction_ABC):
- 	"""
- 	This is the interface all scenari must expose. In order for the trainer/recorder to know which attributes are hyper-parameters,
- 	this class must also include a list attribute **self.hyperParameters** containing the names of all attributes that must be considered
- 	as hyper-parameters.
- 	"""
-	def apply(self, layer, cost) :
-		"""Apply to a layer and update networks's log"""
-		hyps = {}
-		for k in self.hyperParameters :
-			hyps[k] = getattr(self, k)
 
-		message = "%s follows learning scenario %s" % (layer.name, self.__class__.__name__)
-		layer.network.logLayerEvent(layer, message, hyps)
+__all__ = ["LearningScenario_ABC", "ParameterGradUpdates", "OptimizerFreeResults", "OptimizerResult", "Fixed", "GradientDescent"]
 
-		return self.getUpdates(layer, cost)
+class IncompatibleLearningScenarios(Exception) :
+    def __init__(self, msg) :
+        self.message = msg
 
-	def getUpdates(self, layer, cost) :
-		"""return the updates for the parameters of layer. Must be implemented in child"""
-		raise NotImplemented("Must be implemented in child")
+    def __str__(self) :
+        return self.message
+        
+    def __repr__(self):
+        return self.message
 
-	# def update(self, trainerStore) :
-	# 	"""reads the store of the trainer (trainer.store) and does something to the hyper-parameters.
-	# 	This function should be used to implement things such as decreasing the learning rate with the epochs.
-	# 	Implementing this function is optional, by default it does nothing. The prefered method is to 
-	# 	declare hyper-parameters as theano shared variables, define theano functions that update their values,
-	# 	and finaly call those functions here."""
-	# 	pass
+class ConflictResolve(object):
+    """In Mariana scenari can be chained. The children of that class defines what to do in case of conflict"""
+    def __init__(self, warning=False):
+        super(ConflictResolve, self).__init__()
+        self.warning=warning
+
+    def apply(self, previous, current) :
+        if self.warning :
+            print("Resolving conflict between scenari using %s" % self.__class__.__name__)
+        
+        return self.resolve(previous, current)
+
+    def resolve(self, previous, current) :
+        raise NotImplemented("Should be implemented in child")
+
+class Overwrite(ConflictResolve):
+    """Overwrite the previous value"""
+    def resolve(self, previous, current) :
+        return current
+
+class Ignore(ConflictResolve):
+    """Ignore the update and keep the previous value"""
+    def resolve(self, previous, current) :
+        return previous
+
+class Die(ConflictResolve):
+    """No conflic resolve, crashes everything"""
+    def resolve(self, previous, current) :
+        if previous.gradient is not None or previous.update is not None:
+            raise IncompatibleLearningScenarios("Learning scenario is incompatible with previous ones (%s)" % previous)
+
+class ParameterGradUpdates(object):
+    """docstring for ParameterGradUpdates"""
+    def __init__(self, parameter, name, gradient, update):
+        super(ParameterGradUpdates, self).__init__()
+        self.name = name
+        self.parameter = parameter
+        self.update = update
+        self.gradient = gradient
+
+class OptimizerResult(ParameterGradUpdates):
+    """use this a return object for an optimizer"""
+    def __init__(self, parameter, name, gradient, update):
+        super(OptimizerResult, self).__init__(parameter, name, gradient, update)
+        self.coParameters = []
+   
+    def addCoParameter(self, parameter, name, gradient, update) :
+        param = ParameterGradUpdates(parameter, name, gradient, update)
+        self.coParameters.append(param)
+    
+    def __repr__(self) :
+        return "< optimizer result for: %s (id: %s)>"  % (self.parameter, id(self))
+
+class LearningScenario_ABC(MABS.UntrainableAbstraction_ABC, MABS.Apply_ABC):
+    """
+    This is the interface all optimizations rules must expose.
+    """
+    def __init__(self, applyTo=None, inheritable=True, conflictResolve=Die(), **kwargs) :
+        super(LearningScenario_ABC, self).__init__(**kwargs)
+        if applyTo :
+            self.applyTo = set(applyTo)
+            self.setHP("applyTo", applyTo)
+        else :
+            self.applyTo = applyTo
+
+        self.inheritable = inheritable
+        self.conflictResolve = conflictResolve
+        # self.memory = {}
+
+    def isInheritable(self) :
+        return self.inheritable
+
+    def apply(self, abstraction, parameterName, loss, previous=None) :
+        """Apply to a abstraction and update networks's log"""
+
+        if self.applyTo is not None and parameterName not in self.applyTo :
+            return None
+
+        try:
+            parameter = abstraction.getP(parameterName)
+        except :
+            raise KeyError("%s has no parameter %s"%(abstraction, parameterName))
+
+        # if (parameter in self.memory) and not self.force :
+            # return self.memory[parameter]
+
+        v = self.run(parameter=parameter, parameterName=parameterName, loss=loss, abstraction=abstraction, previous=previous)
+        if previous :
+            try :
+                return self.conflictResolve.apply(previous, v)
+            except IncompatibleLearningScenarios :
+                raise IncompatibleLearningScenarios("Learning scenario: '%s' is incompatible with previous updates (abstraction: '%s', previous: '%s')" % (self.__class__.__name__, abstraction.name, previous))
+
+        # for cp in v.coParameters :
+            # abstraction.registerCoParameter(cp.name, cp)
+    
+        return v
+
+    def run(self, parameter, parameterName, loss, abstraction, previous) :
+        """return the updates for the parameters of abstraction. Must be implemented in child"""
+        raise NotImplemented("Must be implemented in child")
+
+class Independent(LearningScenario_ABC):
+    "Indicates that the abstraction does not inherit optimization rules form the outputs. Must be placed at the first positon of the list."
+    def __init__(self):
+       super(Independent, self).__init__(inheritable=False)
+
+    def run(*args, **kwargs) :
+        return None
 
 class Fixed(LearningScenario_ABC):
-	"No learning, the layer weights stay fixed"
- 	def __init__(self):
- 		LearningScenario_ABC.__init__(self)
- 		
- 	def getUpdates(self, layer, cost) :
-		return []
+    "No learning, the abstraction parameters stay fixed"
+    def __init__(self, applyTo=None, inheritable=False, conflictResolve=Overwrite(), **kwargs):
+       super(Fixed, self).__init__(applyTo, inheritable, conflictResolve, **kwargs)
+        
+    def run(self, parameter, **kwargs) :
+        ret = OptimizerResult(parameter, None, None, None)
+        return ret
 
 class GradientDescent(LearningScenario_ABC):
-	"The GradientDescent scenario has a fixed learning rate."
- 	def __init__(self, lr):
- 		LearningScenario_ABC.__init__(self)
- 		self.lr = lr
- 		self.hyperParameters = ["lr"]
- 		self.gradients = {}
- 		self.updates = {}
+    "The GradientDescent scenario has a fixed learning rate."
+    def __init__(self, lr, momentum=0, reverse=False, conflictResolve=Die(), **kwargs):
+        """
+        use reverse = True for gradient ascent.
+        """
+        super(GradientDescent, self).__init__(conflictResolve=conflictResolve, **kwargs)
+        
+        self.addHyperParameters({
+            "lr": lr,
+            "momentum": momentum,
+            "reverse": reverse
+        })
+        
+    def run(self, parameter, parameterName, loss, **kwargs) :
+        pVar = parameter.getVar()
+        gparam = tt.grad(loss, pVar)
+        if self.getHP("momentum") == 0 :
+            if not self.getHP("reverse") :
+                param_update = parameter.getVar() - self.getHP("lr") * gparam
+            else : 
+                param_update = parameter.getVar() + self.getHP("lr") * gparam
+            
+            ret = OptimizerResult(parameter.getVar(), parameterName, gparam, param_update)
+        else :
+            momentum_param = theano.shared(parameter.getValue()*0., broadcastable=parameter.getVar().broadcastable, name="momentum.%s" % (parameterName))
+            momentum_update = self.getHP("momentum") * momentum_param + (1-self.getHP("momentum"))*gparam
+            if not self.getHP("reverse") :
+                param_update = parameter.getVar() - self.getHP("lr") * momentum_param
+            else :
+                param_update = parameter.getVar() + self.getHP("lr") * momentum_param
+            
+            ret = OptimizerResult(parameter.getVar(), parameterName, gparam, param_update)
+            ret.addCoParameter(momentum_param, "momentum", None, momentum_update)
 
- 	def getUpdates(self, layer, cost) :
- 		updates = []
- 		# print layer.getParameters()
- 		for param in layer.getParameters() :
-			gparam = tt.grad(cost, param)
- 			updates.append((param, param - self.lr * gparam))
- 			self.updates[param] = param - self.lr * gparam
- 			self.gradients[param] = gparam
- 
-		return updates
+        return ret
 
-class MomentumGradientDescent(LearningScenario_ABC):
-	"The MomentumGradientDescent scenario has a fixed learning rate and a fixed momentum."
- 	def __init__(self, lr, momentum):
- 		LearningScenario_ABC.__init__(self)
- 		self.lr = lr
- 		self.momentum = momentum
- 		self.hyperParameters = ["lr", "momentum"]
+SGD = GradientDescent
 
- 		self.gradients = {}
- 		self.updates = {}
+#class GradientClipping(LearningScenario_ABC):
+#    "Clips previous update to a minimum and maximum value."
+#    def __init__(self, minimum, maximum, conflictResolve=Overwrite(), **kwargs):
+#        """
+#        """
+#        super(GradientClipping, self).__init__(conflictResolve=conflictResolve, **kwargs)
+#        self.addHyperParameters({
+#            "minimum": minimum,
+#            "maximum": maximum,
+#        })
+        
+#    def run(self, parameter, parameterName, loss, **kwargs) :
+#        previous = kwargs["previous"]
+#        previous.gradient = tt.clip(previous.gradient, self.getHP("minimum"), self.getHP("maximum"))
 
- 	def getUpdates(self, layer, cost) :
- 		updates = []
- 		for pname, param in layer.getParameterDict().iteritems() :
- 			gparam = tt.grad(cost, param)
-	 		momentum_param = theano.shared(param.get_value()*0., broadcastable=param.broadcastable, name="momentum-%s_%s" % (layer.name, pname))
-			v = self.momentum * momentum_param + (1-self.momentum)*gparam
-			updates.append((momentum_param, v ))
-			updates.append((param, param - self.lr * momentum_param))
+#        return previous
 
- 			self.updates[param] = v
- 			self.updates["momentum"] = param - self.lr * momentum_param
- 			self.gradients[param] = gparam
+class Adam(LearningScenario_ABC):
+    "The Adam. Uses lasagne as backend"
+    def __init__(self, lr=0.001, beta1=0.9, beta2=0.999, epsilon=1e-8, conflictResolve=Die(), **kwargs):
+        """
+        use reverse = True for gradient ascent.
+        """
+        super(Adam, self).__init__(**kwargs)
+        
+        self.addHyperParameters({
+            "lr": lr,
+            "beta1": beta1,
+            "beta2": beta2,
+            "epsilon": epsilon,
+        })
+        
+    def run(self, parameter, parameterName, loss, **kwargs) :
+        pVar = parameter.getVar()
+        gparam = tt.grad(loss, pVar)
+        updates = LUP.adam( [ gparam ], [pVar], learning_rate=self.getHP("lr"), beta1=self.getHP("beta1"), beta2=self.getHP("beta2"), epsilon=self.getHP("epsilon"))
 
-		return updates
+        ret = OptimizerResult(pVar, parameterName, gparam, updates[pVar])
+        i = 0
+        for param, update in updates.items() :
+            if param is not pVar :
+                name = "%s_adam_%s" % (parameterName, i)
+                ret.addCoParameter(param, name, None, update)
+                i += 1
+
+        return ret
+
+class Adamax(LearningScenario_ABC):
+    "The Adamax. Uses lasagne as backend"
+    def __init__(self, lr=0.002, beta1=0.9, beta2=0.999, epsilon=1e-8, conflictResolve=Die(), **kwargs):
+        super(Adamax, self).__init__(conflictResolve=conflictResolve, **kwargs)
+        
+        self.addHyperParameters({
+            "lr": lr,
+            "beta1": beta1,
+            "beta2": beta2,
+            "epsilon": epsilon,
+        })
+        
+    def run(self, parameter, parameterName, loss, **kwargs) :
+        pVar = parameter.getVar()
+        gparam = tt.grad(loss, pVar)
+        updates = LUP.adamax( [ gparam ], [pVar], learning_rate=self.getHP("lr"), beta1=self.getHP("beta1"), beta2=self.getHP("beta2"), epsilon=self.getHP("epsilon"))
+
+        ret = OptimizerResult(pVar, parameterName, gparam, updates[pVar])
+        i = 0
+        for param, update in updates.items() :
+            if param is not pVar :
+                name = "%s_adamax_%s" % (parameterName, i)
+                ret.addCoParameter(param, name, None, update)
+                i += 1
+
+        return ret
+
+class Adadelta(LearningScenario_ABC):
+    "The Adadelta. Uses lasagne as backend"
+    def __init__(self, lr=1.0, rho=0.9, epsilon=1e-6, conflictResolve=Die(), **kwargs):
+        super(Adadelta, self).__init__(conflictResolve=conflictResolve, **kwargs)
+        
+        self.addHyperParameters({
+            "lr": lr,
+            "rho": rho,
+            "epsilon": epsilon,
+        })
+        
+    def run(self, parameter, parameterName, loss, **kwargs) :
+        pVar = parameter.getVar()
+        gparam = tt.grad(loss, pVar)
+        updates = LUP.adadelta( [ gparam ], [pVar], learning_rate=self.getHP("lr"), rho=self.getHP("rho"), epsilon=self.getHP("epsilon"))
+
+        ret = OptimizerResult(pVar, parameterName, gparam, updates[pVar])
+        i = 0
+        for param, update in updates.items() :
+            if param is not pVar :
+                name = "%s_adadelta_%s" % (parameterName, i)
+                ret.addCoParameter(param, name, None, update)
+                i += 1
+
+        return ret
+
+class Adagrad(LearningScenario_ABC):
+    "The Adagrad. Uses lasagne as backend"
+    def __init__(self, lr=1.0, epsilon=1e-6, conflictResolve=Die(), **kwargs):
+        super(Adagrad, self).__init__(conflictResolve=conflictResolve, **kwargs)
+        
+        self.addHyperParameters({
+            "lr": lr,
+            "epsilon": epsilon,
+        })
+        
+    def run(self, parameter, parameterName, loss, **kwargs) :
+        pVar = parameter.getVar()
+        gparam = tt.grad(loss, pVar)
+        updates = LUP.adagrad( [ gparam ], [pVar], learning_rate=self.getHP("lr"), epsilon=self.getHP("epsilon"))
+
+        ret = OptimizerResult(pVar, parameterName, gparam, updates[pVar])
+        i = 0
+        for param, update in updates.items() :
+            if param is not pVar :
+                name = "%s_adagrad_%s" % (parameterName, i)
+                ret.addCoParameter(param, name, None, update)
+                i += 1
+
+        return ret
+
+class RMSProp(LearningScenario_ABC):
+    "The RMSProp. Uses lasagne as backend"
+    def __init__(self, lr=1.0, rho=0.9, epsilon=1e-6, conflictResolve=Die(), **kwargs):
+        super(RMSProp, self).__init__(conflictResolve=conflictResolve, **kwargs)
+        
+        self.addHyperParameters({
+            "lr": lr,
+            "rho": rho,
+            "epsilon": epsilon,
+        })
+        
+    def run(self, parameter, parameterName, loss, **kwargs) :
+        pVar = parameter.getVar()
+        gparam = tt.grad(loss, pVar)
+        updates = LUP.rmsprop( [ gparam ], [pVar], learning_rate=self.getHP("lr"), rho=self.getHP("rho"), epsilon=self.getHP("epsilon"))
+
+        ret = OptimizerResult(pVar, parameterName, gparam, updates[pVar])
+        i = 0
+        for param, update in updates.items() :
+            if param is not pVar :
+                name = "%s_rmsprop_%s" % (parameterName, i)
+                ret.addCoParameter(param, name, None, update)
+                i += 1
+
+        return ret

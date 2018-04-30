@@ -1,90 +1,402 @@
 from collections import OrderedDict
-import theano, sys, numpy
-import sys
+import theano
+import theano.tensor as tt
 
 import Mariana.candies as MCAN
 import Mariana.settings as MSET
+import Mariana.scenari as MS
+import Mariana.custom_types as MTYPES
 
-class TheanoFunction(object) :
-    """
-    This class encapsulates a Theano function.
-    TheanoFunction objects should be defined as self attributes in the setCustomTheanoFunctions() function of output layers.
-    It will also generate custom error messages whose verbosity depends on Mariana.settings.VERBOSE. Set it to False to get quieter
-    error messages.
-    """
+__all__=["UpdateStore", "Updates", "TheanoFunctionHandle", "TheanoFunction"]
 
-    def __init__(self, name, layer, output_expressions, additional_input_expressions = {}, updates = [], **kwargs) :
-        """
-        :param str name: name of the function
-        :param Output layer: the output layer the function should be applied to
-        :param list output_expressions: list of tuples of symbolic expressions you want as output and the names you want to give to them: (name, expressions)
-        :param dict additional_input_expressions: additional inputs needed to compute the expressions
-        :param list updates: list of tuples (shared variable, symbolic expression of the update to be applied to it)
-        :param dict \*\*kwargs: additional arguments to passed to the real theano function underneath
-        """
-        def _bckTrckInputs(startLayer, inputs = OrderedDict(), inpSet = set()) :     
-            if MSET.TYPE_INPUT_LAYER in startLayer.types :
-                inpOut = startLayer.inputs
-                if inpOut not in inpSet :
-                    inputs[startLayer.name] = inpOut
-                    inpSet.add(inpOut)
+class UpdateStore(object):
+    """Stores gradients and updates for parameters in convenient interface"""
+    def __init__(self):
+        super(UpdateStore, self).__init__()
+        self.names = {
+            "updates": OrderedDict(),
+            "gradients": OrderedDict(),
+        }
+        self.updates = OrderedDict()
+        self.gradients = OrderedDict()
+    
+    def add(self, parameter, gradient, update, name) :
+        if update is None: 
+            if parameter in self.updates :
+                del self.updates[parameter]
+                del self.names["updates"][parameter]
+        else :
+            self.updates[parameter] = update
+            self.names["updates"][parameter] = name
             
-            for layer in startLayer.network.inConnections[startLayer] :
-                _bckTrckInputs(layer, inputs, inpSet)
-            
-            return inputs, inpSet
+        if gradient is None:
+            if parameter in self.gradients:
+                del self.gradients[parameter]
+                del self.names["gradients"][parameter]
+        else :
+            self.gradients[parameter] = gradient
+            self.names["gradients"][parameter] = name
 
-        self.cast_warning_told = False
+class Updates(object):
+    """Derives the updates for a theano function"""
+    def __init__(self, output_layer, stream, coParametersValues={}):
+        super(Updates, self).__init__()
+        self.output_layers = [output_layer]
+        self.loss = 0
+        self.stream = stream
+        self.store = UpdateStore()
+        self.isCompiled = False
+        self.coParametersValues = coParametersValues
+        # self.coParameters = {}
+
+    def merge(self, updates) :
+        """Merge tow updates by combining their outputs and adding theirs losses. Must be None or another Updates instance"""
+        if self.isCompiled :
+            raise ValueError("Impossible to merge with already compiled updates")
+
+        if updates is not None :
+            if not isinstance(updates, self.__class__) :
+                raise ValueError("Parameter must be an instance of '%s" % self.__class__)
+            self.output_layers.extend(updates.output_layers)
+            # self.loss += updates.loss
+
+    def compile(self) :
+        """Derive the updates and gradients for every parameter in the network"""
+        #append outputs optimization rules at the top level
+        # print "comp"
+        self.loss = 0
+        optimizers = {}
+        names = {}
+        for o in self.output_layers :
+            self.loss += o.loss[self.stream]
+            optimizers[o] = o.abstractions["learningScenari"]
+            names[o] = o.name
+            inheritables = []
+            for ls in o.abstractions["learningScenari"] :
+                if ls.isInheritable() :
+                    inheritables.append(ls)
+
+            for abstraction in o.getTrainableAbstractions() :
+                if len(abstraction.getParameters()) > 0 :
+                    optimizers[abstraction] = list(inheritables)
+                    names[abstraction] = "%s.%s" % (o.name. abstraction.name)
+        
+            for l in o.dependencies.itervalues() :
+                if len(l.getParameters()) > 0  :
+                    if l not in optimizers :
+                        names[l] = l.name
+                        optimizers[l] = []
+                    if len(l.abstractions["learningScenari"]) > 0 :
+                        if not isinstance(l.abstractions["learningScenari"][0], MS.Independent) :
+                            optimizers[l].extend(inheritables)
+                    else :
+                        optimizers[l].extend(inheritables)
+
+                    for abstraction in l.getTrainableAbstractions() :
+                        if len(abstraction.getParameters()) > 0 :
+                            if abstraction not in optimizers :
+                                names[abstraction] = "%s.%s" % (l.name. abstraction.name)
+                                optimizers[abstraction] = []
+                            
+                            if len(abstraction.abstractions["learningScenari"]) > 0 :
+                                if not isinstance(abstraction.abstractions["learningScenari"][0], MS.Independent) :
+                                    optimizers[abstraction].extend(inheritables)
+                            else :
+                                optimizers[abstraction].extend(inheritables)
+
+        #append specific optimization rules
+        for abstraction in optimizers :
+            if abstraction not in self.output_layers :
+                optimizers[abstraction].extend(abstraction.abstractions["learningScenari"])
+            for reg in abstraction.abstractions["regularizations"] :
+                self.loss = reg.apply(abstraction, self.loss, self.stream)
+        
+        preStore = {}
+        appliedOptim = {}
+        for abstraction, scenari in optimizers.iteritems() :
+            for paramName in abstraction.getParameters() :
+                if abstraction.getP(paramName).isShared() :
+                    previousOptim=None
+                    appliedOptim[abstraction] = set()
+                    for sc in scenari :
+                        if sc not in appliedOptim[abstraction] :
+                            appliedOptim[abstraction].add(sc)
+                            optim = sc.apply(abstraction=abstraction, parameterName=paramName, loss=self.loss, previous=previousOptim)
+                            name = "%s.%s" % (names[abstraction], paramName)
+                            if optim :
+                                preStore[name] = {
+                                    "parameter": optim.parameter,
+                                    "gradient": optim.gradient,
+                                    "update" : optim.update,
+                                    "name" : name,
+                                    "coParameters": []
+                                }
+                                for coParam in optim.coParameters :
+                                    preStore[name]["coParameters"].append(
+                                        {
+                                            "parameter": coParam.parameter,
+                                            "gradient": coParam.gradient,
+                                            "update" : coParam.update,
+                                            "name" : "%s.%s" % (name, coParam.name),
+                                        }
+                                    )
+                                previousOptim = optim
+        
+        for gup in preStore.itervalues() :
+            self.store.add( gup["parameter"], gup["gradient"], gup["update"], gup["name"] )
+            for coParam in gup["coParameters"] :
+                if coParam["name"] in self.coParametersValues :
+                    coParam["parameter"].set_value(self.coParametersValues[coParam["name"]])
+                    self.output_layers[0].network.logEvent("updating %s with previoustly saved value" % coParam["name"])
+
+                self.store.add( coParam["parameter"], coParam["gradient"], coParam["update"], coParam["name"] )
+                self.coParametersValues[coParam["name"]] = coParam["parameter"].get_value()
+
+        self.isCompiled = True
+
+    # def __getstate__(self) :
+    #     print "asdsafsa"
+
+    #     res = Updates(None, self.stream, coParametersValues)
+    #     res.output_layers = self.output_layers
+    #     return res.__dict__
+
+class TheanoFunctionHandle(object) :
+    """
+    This a description of a theano function. It is used as a reference for just-in-time compilation of theano functions.
+    TheanoFunctionHandle can be added to each other to create complex rich functions.
+    """
+
+    def __init__(self, name, layer, output, stream, update=False, **theano_kwargs) :
+        """
+        :param str name: The name of the function used to identify its return value
+        :param layer: The associated layer
+        :param output: The theano expression to be returned
+        :parama stream: Usually something like "train" or "test". Defines if regularizations and decorators should be applied
+        :parama bool update: Should it update the parameters when called
+        :param dict \*\*theano_kwargs: additional arguments to passed to the real theano function underneath
+        """
+        super(TheanoFunctionHandle, self).__init__()
+        
+        def _bckTrckInputs(current_layer, stream, inputs = OrderedDict()) :     
+            for k, v in current_layer.__dict__.iteritems() :
+                if isinstance(v, MTYPES.Inputs) and not v.isTied(stream):
+                    inputs["%s.%s" % (current_layer.name, k)] = v[stream]
+  
+            for layer in current_layer.network.inConnections[current_layer] :
+                _bckTrckInputs(layer, stream, inputs)
+            
+            return inputs
 
         self.name = name
+        self.update = update
         self.layer = layer
+        self.stream = stream
+        self.theano_kwargs = theano_kwargs
 
-        self.inputs, inpSet = _bckTrckInputs(layer)
+        self.inputs = _bckTrckInputs(layer, stream)
+        for k, v in layer.__dict__.iteritems() :
+            if isinstance(v, MTYPES.Targets) and not v.isTied(stream) :
+                self.inputs["%s.%s" % (layer.name, k)] = v[stream]
 
-        for k, v in additional_input_expressions.iteritems() :
-            if v not in inpSet :
-                self.inputs[k] = v
-                inpSet.add(v)
+        try :
+            self.output = output[stream]
+        except :
+            raise ValueError("Output does not have a stream: '%s'" % stream)
 
-        self.fctInputs = OrderedDict()
-        for i in self.inputs :
-            self.fctInputs[i] = None
+        # self.theano_fct = None
 
-        self.additional_input_expressions = additional_input_expressions
+    def hasUpdates(self) :
+        """returns True if the function updates the parameters, False other wise."""
+        return self.update
+    
+class KolokoTheanoFunction(object) :
+    """
+    This class encapsulates a just-in-time compiled Theano function.
+    """
+    def __init__(self) :
+        super(KolokoTheanoFunction, self).__init__()
+
+        self.theano_handles = []
+
+        self.theano_fct = None
+        self.gradients_fct = None
+        self.updates_fct = None
+
+        self.inputs = None
+        self.outputs = None
+        self.updates = None
+    
+        self.perfomUpdates = None
+        self.stream = None
         
-        self.output_expressions = OrderedDict()
-        for name, output_expr in output_expressions :
-            self.output_expressions[name] = output_expr
+        self.uncompiledSelf = None
+         
+        self.transfer = False
+
+    def setTarget(self, transfer) :
+        """
+        :parama transfer: Will transfer the output to the desired device. Ex, for compatibility between GPU and CPU use 'cpu'. For lighting fast uncompatible with GPU results use None. If you don't know what this is don't use it.
+        """
+        self.transfer = transfer
+
+    def isCompiled(self) :
+        """Has the compildation already happend?"""
+        return self.theano_fct is not None
+
+    def __add__(self, mar_theano_fct) :
+        if self.stream != mar_theano_fct.stream :
+            raise ValueError("All functions must be on the same stream. Got: '%s' and '%s' " % (self.stream, mar_theano_fct.stream))
+
+        fct = KolokoTheanoFunction()
+        fct.stream = self.stream
+
+        for hand in self.theano_handles :
+            fct.addHandle(hand)
+    
+        for hand in mar_theano_fct.theano_handles :
+            fct.addHandle(hand)
+
+        return fct
+
+    def addHandle(self, theano_handle) :
+        """Add a handle to the current definition. Losses will be added up and updates will be merged"""
+        if not isinstance(theano_handle, TheanoFunctionHandle) :
+            raise ValueError("theano_handle must be an instance of TheanoFunctionHandle")
+
+        self.theano_handles.append(theano_handle)
+    
+    def compile(self):
+        """Compile the function just-in-time according the definitions given by the handles."""
+        if not self.isCompiled() :
+            self.perfomUpdates = False
+            
+            self.inputs = OrderedDict()
+            self.inputs_varToName = OrderedDict()
+            self.outputs = OrderedDict()
+            self.updates = None
+            
+            self.theano_kwargs = {}
+            varToName = OrderedDict()
+            for handle in self.theano_handles :
+                self.theano_kwargs.update(handle.theano_kwargs)
+                
+                for k, v in handle.inputs.iteritems() :
+                    varToName[v] = k
+                
+                output = handle.output
+                if self.transfer is not False :
+                    print "wrap: transfer", self.transfer
+                    output = output.transfer(self.transfer)
+                
+                self.outputs["%s.%s" % (handle.layer.name, handle.name)] = output
+                
+                if handle.hasUpdates() :
+                    self.perfomUpdates = True
+                    if self.updates is None :
+                        self.updates = Updates(handle.layer, handle.stream)
+                    else :
+                        self.updates.merge(Updates(handle.layer, handle.stream))
+
+            all_theano_inputs = set(theano.gof.graph.inputs(self.outputs.values()))
+            for inp in all_theano_inputs :
+                try :
+                    name = varToName[inp]
+                    self.inputs[name] = inp
+                    self.inputs_varToName[inp] = name
+                except KeyError :
+                    pass
+
+            updates = {}
+            if self.updates :
+                self.updates.compile()
+                if self.perfomUpdates :
+                    updates = self.updates.store.updates
+            
+            self.theano_fct = theano.function(inputs = self.inputs.values(), outputs = self.outputs.values(), updates = updates, **self.theano_kwargs)
+            
+            # if MSET.DEVICE_IS_GPU :
+            #     if str(self.getToposort()).find("float64") > -1:
+            #         msg = "There are some float64s that do not fit on the GPU and will slow down the computations.\nPlease consider:"
+            #         msg += "\n\t* Launching with THEANO_FLAGS=device=gpu,floatX=float32 python <your script>.py."
+            #         msg += "\n\t* If you have any dmatrix, dvector or dscalar in your code replace them with matrix, vector, scalar."
+            #         MCAN.friendly("Run device", msg, warning = True)
+            
+            # self.uncompiledSelfults = OrderedDict()
+
+    def _parseInputs(self, inputs = {}, ignoreUnexpected=False) :
+        """parse function inputs and raises SyntaxError exceptions with friendly, human readable errors"""
+        # if len(inputs) != len(self.inputs_varToName) :
+        givens = set(inputs.keys())
+        expected = set(self.inputs_varToName.values())
+        missing = list(expected - givens)
+        notInvited = list(givens - expected)
+        msg = []
+        if len(missing) > 0 :
+            msg.append("Missing arguments: %s" % str(missing)[1:-1])
+        if len(notInvited) > 0 and not ignoreUnexpected :
+            msg.append("Unexpected arguments: %s" % str(notInvited)[1:-1])
+        if len(msg) > 0 :
+            raise SyntaxError('\n'.join(msg))
+
+        fct_inputs = OrderedDict()
+        for param, pname in self.inputs_varToName.iteritems() :
+            # print param, pname, inputs
+            fct_inputs[param] = inputs[pname]
         
-        kwUpdates = {}
-        for k, v in updates :
-            if k in kwUpdates :
-                message = "Parameter '%s' has more than one defined update, only using the first" % k
-                if MSET.VERBOSE :
-                    print(message)
-                layer.network.logLayerEvent(layer, message)     
+        return fct_inputs
+
+    def run(self, inputs = {}, ignoreUnexpected=False) :
+        """run the function and return the results"""
+        self.compile()
+        fct_inputs = self._parseInputs(inputs, ignoreUnexpected)
+
+        fres = iter(self.theano_fct(*fct_inputs.values()))
+        results = OrderedDict()
+        for k in self.outputs.iterkeys() :
+            results[k] = fres.next()
+        return results
+
+    def getGradients(self, inputs={}, ignoreUnexpected=False) :
+        """return the gradients that would be performed"""
+        self.compile()
+        if not self.updates :
+            raise TypeError("Function has no updates, cannot have gradients")
+
+        fct_inputs = self._parseInputs(inputs, ignoreUnexpected)
+        if not self.gradients_fct :
+            self.gradients_fct = theano.function(inputs = self.inputs.values(), outputs = self.updates.store.gradients.values(), **self.theano_kwargs)
+
+        fres = iter(self.gradients_fct(*fct_inputs.values()))
+        results = OrderedDict()
+        for k in self.updates.store.names["gradients"].itervalues() :
+            results[k] = fres.next()
+        return results
+        
+    def getUpdates(self, inputs={}, ignoreUnexpected=False) :
+        """return the updates that would be performed"""
+        self.compile()
+        if not self.updates :
+            raise TypeError("Function has no updates")
+        fct_inputs = self._parseInputs(inputs, ignoreUnexpected)
+
+        if not self.updates_fct :
+            self.updates_fct = theano.function(inputs = self.inputs.values(), outputs = self.updates.store.updates.values(), **self.theano_kwargs)
+
+        fres = iter(self.updates_fct(*fct_inputs.values()))
+        results = OrderedDict()
+        for k in self.updates.store.names["updates"].itervalues() :
+            results[k] = fres.next()
+        return results
+
+    def help(self, forceCompile = True):
+        """return a description of the function and its expected arguments"""
+        if not self.isCompiled() :
+            if not forceCompile :
+                return "<stream: {stream}, not compiled>".format(stream=self.stream)
             else :
-                kwUpdates[k] = v
-
-        self.updates = kwUpdates.items()
-        # print self.name, self.inputs, layer, self.output_expressions
-        self.theano_fct = theano.function(inputs = self.inputs.values(), outputs = self.output_expressions.values(), updates = self.updates, **kwargs)
-
-        warningMsg = False
-        if MSET.DEVICE_IS_GPU :
-            device = "GPU"
-            msg = "I will use the [-%s-] to run function '%s' of layer '%s'!" % (device, name, layer.name)
-            if str(self.getToposort()).find("float64") > -1:
-                warningMsg = True
-                msg += "\n\nBut there are some float64s that do not fit on the GPU and will slow down the computations.\nPlease consider:"
-                msg += "\n\t* Launching with THEANO_FLAGS=device=gpu,floatX=float32 python <your script>.py."
-                msg += "\n\t* If you have any dmatrix, dvector or dscalar in your code replace them with matrix, vector, scalar."
-        else:
-            device = "CPU"
-            msg = "I will use the [-%s-] to run function '%s' of layer '%s'!" % (device, name, layer.name)
-
-        self.results = OrderedDict()
-        MCAN.friendly("Run device", msg, warning = warningMsg)
+                self.compile()
+        return "<stream: {stream}, arguments: {arguments}>".format(stream=self.stream, arguments=self.inputs_varToName.values())
 
     def getToposort(self) :
         """returns the toposort ( name of all ops  of the function in order of application ) of the function"""
@@ -103,33 +415,134 @@ class TheanoFunction(object) :
         import theano.d3viz as d3v
         d3v.d3viz(self.theano_fct, filename)
 
-    def run(self, **kwargs) :
-        """Run the theano function with the kwargs. Will return an OrderedDict of the outputs"""
-        def _die(fctName, layer, kwargs, exc) :
-            localStr = "!!=> Error in function '%s' for layer '%s':\n%s\n" % (fctName, layer.name, exc.message)
-            sys.stderr.write(localStr)
-            sys.stderr.write("Have a look at the log file: %s for details about the arguments" % MSET.SAVE_MESSAGE_LOG_FILE)
-            strArgs = []
-            for k, v in kwargs.iteritems() :
-                strArgs.append("%s, shape: %s \n----\n%s" % (k, numpy.asarray(v).shape, v))
-            MCAN.fatal(localStr, "!!=> the arguments were:\n %s\n" % ('\n'.join(strArgs)), toRaise = exc)
-
-        self.fctInputs.update(kwargs)
-        try :
-            fres = iter(self.theano_fct(*self.fctInputs.values()))
-        except Exception as e:
-            _die(self.name, self.layer, kwargs, e)
-            
-        for k in self.output_expressions.iterkeys() :
-            self.results[k] = fres.next()
-
-        return self.results
-
-    def __call__(self, **kwargs) :
-        return self.run(**kwargs)
+    def __call__(self, *args, **kwargs) :
+        """a convenient alias to run()"""
+        return self.run(*args, **kwargs)
 
     def __repr__(self) :
-        return "<Mariana Theano Fct '%s'>" % self.name
+        if not self.isCompiled() :
+            if len(self.theano_handles) == 1 :
+                return "< Uncompiled Mariana Theano Fct: %s.%s >" %(self.theano_handles[0].layer.name, self.theano_handles[0].name)
+            else :
+                s =[]
+                for hand in self.theano_handles :
+                    s.append("%s.%s" %(hand.layer.name, hand.name))
+                return "< Uncompiled Mariana Theano Fct Mix: %s >" % (' + '.join(s) )
+        else :
+            args = [] 
+            for k, v in self.inputs_varToName.items() :
+                args.append("%s: %s" %(v, k))
 
-    def __str__(self) :
-        return "<Mariana Theano Fct '%s': %s>" % (self.name, self.theano_fct)
+            return "<Compiled Mariana Theano Fct '%s'. Arguments: '%s'>" % (id(self), ', '.join(args))
+
+    def __getstate__(self) :
+        def getUncompiledSelf() :
+            res = KolokoTheanoFunction()
+            res.theano_handles = self.theano_handles
+            res.stream = self.stream
+            return res
+
+        if not self.isCompiled() :
+            return getUncompiledSelf().__dict__
+            
+        if not self.uncompiledSelf :
+            self.uncompiledSelf = getUncompiledSelf()        
+        # print "aaa", self.updates.coParameters
+        return self.uncompiledSelf.__dict__
+
+class TheanoFunction(KolokoTheanoFunction):
+    """docstring for TheanoFunction"""
+    def __init__(self, name, layer, output, stream, update=False, **theano_kwargs):
+        super(TheanoFunction, self).__init__()
+        self.stream = stream
+        self.theano_handles = [TheanoFunctionHandle(name, layer, output, stream, update=update, **theano_kwargs)]
+
+class TheanoFunctionGroup(object):
+    """High level that wraps a group of function (one for every stream)"""
+    def __init__(self, name, layer, outputs, **theano_kwargs):
+        super(TheanoFunctionGroup, self).__init__()
+        
+        self.name = name
+        self.layer = layer
+        self.outputs = outputs
+        self.theano_kwargs = theano_kwargs
+
+        self.functions = {}
+        try :
+            streams = self.outputs.streams
+        except AttributeError :
+            try:
+                streams = self.outputs.keys()
+            except KeyError:
+                raise ValueError("Unable to derive streams form object: '%s'" % self.outputs)
+
+        for stream in streams :
+            self.functions[stream] = None
+
+        self.updates = set()
+        self.mustInit = True
+    
+        self.transfer = False
+
+    def setTarget(self, transfer) :
+        """
+        :parama transfer: Will transfer the output to the desired device. Ex, for compatibility between GPU and CPU use 'cpu'. For lighting fast uncompatible with GPU results use None. If you don't know what this is don't use it.
+        """
+        self.transfer = transfer
+
+    def allowUpdates(self, stream) :
+        """Apply updates on a given stream"""
+        if stream not in self :
+            raise ValueError("Output has no stream: '%s'" % stream)
+        self.updates.add(stream)
+
+    def removeUpdates(self, stream) :
+        """Removes updates from a given stream"""
+        if stream not in self :
+            raise ValueError("Output has no stream: '%s'" % stream)
+        self.updates.remove(stream)
+    
+    def init(self) :
+        """Initialize the group"""
+        if self.mustInit :
+            for stream in self.functions :
+                update = False
+                if stream in self.updates :
+                    update = True
+                if self.functions[stream] is None :
+                    self.functions[stream] = TheanoFunction("%s.%s" %(self.name, stream), self.layer, self.outputs, stream=stream, update = update, **self.theano_kwargs)
+                    self.functions[stream].setTarget(self.transfer)
+                    
+            self.mustInit = False
+
+    def help(self, forceInit=True):
+        """return the help information for functions in the group"""
+        if self.mustInit :
+            if not forceInit :
+                return "==HELP==\nMariana function group {lname}.{name}, (not initialized)".format(name=self.name, lname=self.layer.name)
+            else :
+                self.init()
+
+        sf = []
+        for f in self.functions.values() :
+            sf.append('  '+f.help())
+
+        sf = "\n".join(sf)
+
+        s = "==HELP==\nMariana function group {lname}.{name}:\n{fcts}\n".format(name=self.name, lname=self.layer.name, fcts=sf)
+        return s
+
+    def __getitem__(self, stream) :
+        self.init()
+        return self.functions[stream]
+
+    def __setitem__(self, stream, v) :
+        if stream not in self :
+            raise ValueError("Cannot add a function. Output has no stream: '%s'" % stream)
+
+        self.functions[stream] = v
+        self.mustInit = True
+
+    def __contains__(self, stream) :
+        """check if the stream is supported"""
+        return stream in self.functions

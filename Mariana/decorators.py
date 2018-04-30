@@ -2,34 +2,27 @@ import numpy
 import theano
 import theano.tensor as tt
 import Mariana.settings as MSET
-from Mariana.abstraction import Abstraction_ABC
+import Mariana.abstraction as MABS
 import Mariana.initializations as MI
+import Mariana.useful as MUSE
+import Mariana.custom_types as MTYPES
 
 __all__= ["Decorator_ABC", "BatchNormalization", "Center", "Normalize", "Mask", "RandomMask", "BinomialDropout", "Clip", "AdditiveGaussianNoise", "MultiplicativeGaussianNoise"]
 
-def iCast(thing) :
-    if thing.dtype.find("int") > -1 :
-        return tt.cast(thing, MSET.INTX)
-    else :
-        return tt.cast(thing, theano.config.floatX)
+class Decorator_ABC(MABS.TrainableAbstraction_ABC, MABS.Apply_ABC) :
+    """A decorator is a modifier that is applied on a layer's output. They are always the last the abstraction to be applied."""
 
-class Decorator_ABC(Abstraction_ABC) :
-    """A decorator is a modifier that is applied on a layer. They are always the last the abstraction to be applied and they can transform a layer in anyway they want."""
+    def __init__(self, streams, **kwargs):
+        super(Decorator_ABC, self).__init__(**kwargs)
+        self.streams = set(self.streams)
+        self.setHP("streams", streams)
 
-    def __call__(self, **kwargs) :
-        self.decorate(**kwargs)
-
-    def apply(self, layer) :
+    def apply(self, layer, stream) :
         """Apply to a layer and update networks's log"""
-        hyps = {}
-        for k in self.hyperParameters :
-            hyps[k] = getattr(self, k)
+        if stream in self.streams :
+	        return self.run(layer, stream=stream)
 
-        message = "%s is decorated by %s" % (layer.name, self.__class__.__name__)
-        layer.network.logLayerEvent(layer, message, hyps)
-        return self.decorate(layer)
-
-    def decorate(self, layer) :
+    def run(self, layer, stream) :
         """The function that all decorator_ABCs must implement"""
         raise NotImplemented("This one should be implemented in child")
 
@@ -46,227 +39,164 @@ class Mask(Decorator_ABC):
     :param array/list mask: It should have the same dimensions as the layer's outputs.
 
     """
-    def __init__(self, mask, onTrain=True, onTest=False):
-        Decorator_ABC.__init__(self)
+    def __init__(self, mask, streams=["train"], **kwargs):
+        super(Mask, self).__init__(streams, **kwargs)
         self.mask = tt.cast(mask, theano.config.floatX)
-        self.onTrain = onTrain
-        self.onTest = onTest
-        self.hyperParameters.extend(["onTrain", "onTest"])
-
-    def decorate(self, layer) :
-        if self.onTrain :
-            layer.outputs = layer.outputs * self.mask
+        self.setHP("mask", mask)
         
-        if self.onTest :
-            layer.testOutputs = layer.testOutputs * self.mask
+    def run(self, layer, stream) :
+        layer.outputs[stream] = layer.outputs[stream] * self.mask
 
 class RandomMask(Decorator_ABC):
     """
-    This decorator takes a list of masks and will randomly apply them to the outputs of the layer it decorates.
+    This decorator takes a list of masks and will randomly apply them to the outputs of the layer it runs.
     Could be used as a fast approximation for dropout. 
     """
-    def __init__(self, masks, onTrain=True, onTest=False, *args, **kwargs):
-        Decorator_ABC.__init__(self)
-        self.nbMasks = len(masks)
-        self.onTest = onTest
-        self.onTrain = onTrain
+    def __init__(self, masks, streams=["train"], **kwargs):
+        super(RandomMask, self).__init__(streams, **kwargs)
+        self.masks = tt.cast(mask, theano.config.floatX)
+        self.setHP("masks", masks)
 
-        if self.nbMasks > 0 :
-            self.masks = theano.shared(numpy.asarray(masks, dtype=theano.config.floatX))
-            self.hyperParameters.extend([])
+    def run(self, layer, stream) :
+        rnd = tt.shared_randomstreams.RandomStreams(seed=MSET.RANDOM_SEED)
+        maskId = rnd.random_integers(low=0, high=self.nbMasks-1, ndim=1)
+        mask = self.masks[maskId]
 
-    def decorate(self, layer) :
-        if self.nbMasks > 0 :
-            rnd = tt.shared_randomstreams.RandomStreams()
-            maskId = rnd.random_integers(low=0, high=self.nbMasks-1, ndim=1)
-            mask = self.masks[maskId]
-
-            if self.onTrain :
-                layer.outputs = layer.outputs * mask
-    
-            if self.onTest :
-                layer.testOutputs = layer.testOutputs * mask
+        layer.outputs[stream] = layer.outputs[stream] * mask
 
 class BinomialDropout(Decorator_ABC):
     """Stochastically mask some parts of the output of the layer. Use it to make things such as denoising autoencoders and dropout layers"""
-    def __init__(self, ratio, onTrain=True, onTest=False):
-        Decorator_ABC.__init__(self)
-
-        assert (ratio >= 0 and ratio <= 1)
-        self.ratio = ratio
-        self.seed = MSET.RANDOM_SEED
+    def __init__(self, dropoutRatio, streams=["train"], **kwargs):
+        super(BinomialDropout, self).__init__(streams, **kwargs)
+        assert (dropoutRatio >= 0 and dropoutRatio <= 1)
+        # self.dropoutRatio = dropoutRatio
+        # self.seed = MSET.RANDOM_SEED
+        self.setHP("dropoutRatio", dropoutRatio)
         
-        self.onTrain = onTrain
-        self.onTest = onTest
-        self.hyperParameters.extend(["ratio", "onTrain", "onTest"])
-
-    def _decorate(self, outputs) :
-        if self.ratio <= 0 :
-            return outputs
-        rnd = tt.shared_randomstreams.RandomStreams()
-        mask = rnd.binomial(n = 1, p = (1-self.ratio), size = outputs.shape)
-        # cast to stay in GPU float limit
-        mask = iCast(mask)
-        return (outputs * mask)
-
-    def decorate(self, layer) :
-        if self.onTrain :
-            layer.outputs = self._decorate(layer.outputs)
-        
-        if self.onTest :
-            layer.testOutputs = self._decorate(layer.testOutputs)
+    def run(self, layer, stream) :        
+        if self.getHP("dropoutRatio") > 0 :
+            rnd = tt.shared_randomstreams.RandomStreams(seed=MSET.RANDOM_SEED)
+            mask = rnd.binomial(n = 1, p = (1-self.getHP("dropoutRatio")), size = layer.outputs[stream].shape, dtype=theano.config.floatX)
+            # cast to stay in GPU float limit
+            mask = MUSE.iCast_theano(mask)
+            layer.outputs[stream] = layer.outputs[stream] * mask
 
 class Center(Decorator_ABC) :
     """Centers the outputs by substracting the mean"""
-    def __init__(self, onTrain=True, onTest=True):
-        Decorator_ABC.__init__(self)
-        self.onTrain = onTrain
-        self.onTest = onTest
-        self.hyperParameters.extend(["onTrain", "onTest"])
-
-    def decorate(self, layer) :
-        if self.onTrain :
-            layer.output = layer.output-tt.mean(layer.output)
-        if self.onTest :
-            layer.testOutput = layer.testOutput-tt.mean(layer.testOutput)
+    def __init__(self, streams=["train"], **kwargs):
+        super(Center, self).__init__(streams, **kwargs)
+        
+    def run(self, layer, stream) :
+        layer.outputs[stream] = layer.outputs[stream]-tt.mean(layer.outputs[stream])
 
 class Normalize(Decorator_ABC) :
     """
-    Normalizes the outputs by substracting the mean and deviding by the standard deviation
+    Normalizes the outputs by substracting the mean and dividing by the standard deviation
 
-    :param float espilon: Actually it is not the std that is used but the approximation: sqrt(Variance + epsilon). Use this parameter to set the epsilon value
+    :param float epsilon: Actually it is not the std that is used but the approximation: sqrt(Variance + epsilon). Use this parameter to set the epsilon value
     """
 
-    def __init__(self, espilon=1e-6, onTrain=True, onTest=True) :
-        Decorator_ABC.__init__(self)
-        self.espilon = espilon
-        self.onTrain = onTrain
-        self.onTest = onTest
-        self.hyperParameters.extend(["onTrain", "onTest", "epsilon"])
+    def __init__(self, epsilon=1e-6, streams=["train"]) :
+        super(Normalize, self).__init__(streams, **kwargs) 
+        self.setHP("epsilon", epsilon)
 
-    def decorate(self, layer) :
-        if self.onTrain :
-            std = tt.sqrt( tt.var(layer.outputs) + self.espilon )
-            layer.output = ( layer.output-tt.mean(layer.output) / std )
+    def run(self, layer, stream) :
+        std = tt.sqrt( tt.var(layer.outputs[stream]) + self.epsilon )
+        layer.outputs[stream] = ( layer.outputs[stream]-tt.mean(layer.output) / std )
 
-        if self.onTest :
-            std = tt.sqrt( tt.var(layer.testOutputs) + self.espilon )
-            layer.testOutput = ( layer.testOutput-tt.mean(layer.testOutput) ) / std
-
-class BatchNormalization(Decorator_ABC):
-    """Applies Batch Normalization to the outputs of the layer.
-    Implementation according to Sergey Ioffe and Christian Szegedy (http://arxiv.org/abs/1502.03167)
+# class BatchNormalization(Decorator_ABC):
+#     """Applies Batch Normalization to the outputs of the layer.
+#     Implementation according to Sergey Ioffe and Christian Szegedy (http://arxiv.org/abs/1502.03167)
     
-        .. math::
+#         .. math::
 
-            W * ( inputs - mean(mu) )/( std(inputs) ) + b
+#            \\gamma * \\frac{x - \\mu}{\\sqrt{\\sigma^2 + \\epsilon}} + \\beta
 
-        Where W and b are learned and std stands for the standard deviation. The mean and the std are computed accross the whole minibatch.
+#         Where \\gamma and \\beta are learned and std stands for the standard deviation. The mean and the std are computed accross the whole minibatch.
 
-        :param float epsilon: Actually it is not the std that is used but the approximation: sqrt(Variance + epsilon). Use this parameter to set the epsilon value
-        :param initialization WInitialization: How to initizalise the weights. This decorator is smart enough to use layer initializations.
-        :param initialization bInitialization: Same for bias
-    """
+#         :param float epsilon: Actually it is not the std that is used but the approximation: sqrt(Variance + epsilon). Use this parameter to set the epsilon value
+#     """
 
-    def __init__(self, WInitialization=MI.SmallUniformWeights(), bInitialization=MI.ZeroBias(), epsilon=1e-6, onTrain=True, onTest=True) :
-        Decorator_ABC.__init__(self)
-        self.epsilon = epsilon
-        self.WInitialization = WInitialization
-        self.bInitialization = bInitialization
-        self.W = None
-        self.b = None
-        self.paramShape = None
+#     def __init__(self, testMu, testSigma, initializations=[MI.SingleValue('gamma', 1), MI.SingleValue('beta', 0)], epsilon=1e-6, streams=["train", "test"], **kwargs) :
+#         super(BatchNormalization, self).__init__(initializations=initializations, streams=streams, **kwargs)
+#         self.setHP("testMu", testMu)
+#         self.setHP("testSigma", testSigma)
+#         self.setHP("epsilon", epsilon)
+        
+#         self.addParameters({
+#             "gamma": MTYPES.Parameter("gamma"),
+#             "beta": MTYPES.Parameter("beta")
+#         })
 
-        self.onTrain = onTrain
-        self.onTest = onTest
-        self.hyperParameters.extend(["onTrain", "onTest", "epsilon"])
+#     def getParameterShape_abs(self, param, **kwargs) :
+#         return self.parent.getShape_abs()
 
-    def initParameter(self, parameter, value) :
-        setattr(self, parameter, value)
-
-    def getParameterShape(self, *args, **kwargs) :
-        return self.paramShape
-
-    def decorate(self, layer) :
-        if not hasattr(layer, "batchnorm_W") or not hasattr(layer, "batchnorm_b") :
-            self.paramShape = layer.getOutputShape()#(layer.nbOutputs, )
-            self.WInitialization.initialize(self)
-            self.bInitialization.initialize(self)
-
-            layer.batchnorm_W = self.W
-            layer.batchnorm_b = self.b
-
-            if self.onTrain :
-                mu = tt.mean(layer.outputs)
-                sigma = tt.sqrt( tt.var(layer.outputs) + self.epsilon )
-                layer.outputs = layer.batchnorm_W * ( (layer.outputs - mu) / sigma ) + layer.batchnorm_b
-
-            if self.onTest :
-                mu = tt.mean(layer.testOutputs)
-                sigma = tt.sqrt( tt.var(layer.testOutputs) + self.epsilon )
-                layer.testOutputs = layer.batchnorm_W * ( (layer.testOutputs - mu) / sigma ) + layer.batchnorm_b
+#     def run(self, layer, stream) :
+#         if stream == "train" :
+#             mu = tt.mean(layer.outputs[stream])
+#             sigma = tt.sqrt( tt.var(layer.outputs[stream]) + self.getHP("epsilon") )
+#         elif stream == "test" :
+#             mu = self.getHP("testMu")
+#             sigma = self.getHP("testSigma")
+        
+#         layer.outputs[stream] = self.getP("gamma")() * ( (layer.outputs[stream] - mu) / sigma ) + self.getP("beta")()
 
 class Clip(Decorator_ABC):
     """Clips the neurone activations, preventing them to go beyond the specified range"""
-    def __init__(self, lower, upper, onTrain=True, onTest=False):
+    
+    def __init__(self, lower, upper, streams=["train"], **kwargs) :
+        super(Clip, self).__init__(streams, **kwargs) 
         assert lower < upper
-        Decorator_ABC.__init__(self)
+        self.setHP("lower", lower)
+        self.setHP("upper", upper)
+    
+    def run(self, layer, stream) :
+        layer.outputs[stream] = layer.outputs[stream].clip(self.lower, self.upper)
 
-        self.upper = upper
-        self.lower = lower
-        
-        self.onTrain = onTrain
-        self.onTest = onTest
-        self.hyperParameters.extend(["onTrain", "onTest"])
-        
-    def decorate(self, layer) :
-        if self.onTrain :
-            layer.outputs = layer.outputs.clip(self.lower, self.upper)
-        if self.onTest :
-            layer.testOutputs = layer.testOutputs.clip(self.lower, self.upper)
-
-class AdditiveGaussianNoise(Decorator_ABC):
+class AddGaussianNoise(Decorator_ABC):
     """Add gaussian noise to the output of the layer"""
     
-    def __init__(self, std, avg=1, onTrain = True, onTest = False, *args, **kwargs):
-        self.std = std
-        self.avg = avg
-        self.hyperParameters = ["std", "avg"]
-        self.onTrain = onTrain
-        self.onTest = onTest
-        Decorator_ABC.__init__(self, *args, **kwargs)
+    def __init__(self, std, avg=0, streams=["train"], **kwargs):
+        assert std > 0
+        super(AddGaussianNoise, self).__init__(streams, **kwargs) 
+        self.setHP("std", std)
+        self.setHP("avg", avg)
         
-    def _decorate(self, outputs, std) :
-        rnd = tt.shared_randomstreams.RandomStreams()
-        randomPick = rnd.normal(size = outputs.shape, avg=self.avg, std=std)
-        return (outputs + randomPick)
-    
-    def decorate(self, layer) :
-        if self.std > 0 :
-            if self.onTrain :
-                layer.outputs = self._decorate(layer.outputs, self.std)
-            if self.onTest :
-                layer.testOutputs = self._decorate(layer.testOutputs, self.std)
+    def run(self, layer, stream) :
+        rnd = tt.shared_randomstreams.RandomStreams(seed=MSET.RANDOM_SEED)
+        randomVals = rnd.normal(size = layer.getIntrinsicShape(), avg=self.getHP("avg"), std=self.getHP("std") )
+        layer.outputs[stream] = layer.outputs[stream] + randomVals
 
-class MultiplicativeGaussianNoise(Decorator_ABC):
+class MultGaussianNoise(Decorator_ABC):
     """Multiply gaussian noise to the output of the layer"""
-   
-    def __init__(self, std, avg=1, onTrain = True, onTest = False, *args, **kwargs):
-        self.std = std
-        self.avg = avg
-        self.hyperParameters = ["std", "avg"]
-        self.onTrain = onTrain
-        self.onTest = onTest
-        Decorator_ABC.__init__(self, *args, **kwargs)
+    
+    def __init__(self, std, avg=0, streams=["train"], **kwargs):
+        assert std > 0
+        super(MultGaussianNoise, self).__init__(streams, **kwargs) 
+        self.setHP("std", std)
+        self.setHP("avg", avg)
         
-    def _decorate(self, outputs, std) :
-        rnd = tt.shared_randomstreams.RandomStreams()
-        randomPick = rnd.normal(size = outputs.shape, avg=self.avg, std=std)
-        return (outputs * randomPick)
+    def run(self, layer, stream) :
+        rnd = tt.shared_randomstreams.RandomStreams(seed=MSET.RANDOM_SEED)
+        randomVals = rnd.normal(size = layer.getIntrinsicShape(), avg=self.getHP("avg"), std=self.getHP("std") )
+        layer.outputs[stream] = layer.outputs[stream] * randomVals
 
-    def decorate(self, layer) :
-        if self.std > 0 :
-            if self.onTrain :
-                layer.outputs = self._decorate(layer.outputs, self.std)
-            if self.onTest :
-                layer.testOutputs = self._decorate(layer.testOutputs, self.std)
+class Scale(Decorator_ABC):
+    """Multiplies the output by scale"""
+    
+    def __init__(self, scale, streams=["train", "test"], **kwargs):
+        super(Scale, self).__init__(streams, **kwargs) 
+        self.setHP("scale", scale)
+        
+    def run(self, layer, stream) :
+        layer.outputs[stream] = layer.outputs[stream] * self.getHP("scale")
+
+class Shift(Decorator_ABC):
+    """Shifts (addiction) the output by scale"""
+    
+    def __init__(self, shift, streams=["train", "test"], **kwargs):
+        super(Shift, self).__init__(streams, **kwargs) 
+        self.setHP("shift", shift)
+        
+    def run(self, layer, stream) :
+        layer.outputs[stream] = layer.outputs[stream] + self.getHP("shift")

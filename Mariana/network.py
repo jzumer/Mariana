@@ -1,62 +1,22 @@
 from collections import OrderedDict
 from wrappers import TheanoFunction
 import Mariana.settings as MSET
-import types
+import Mariana.abstraction as MABS
 
-__all__= ["Network", "OutputMap"]
+import cPickle, pickle
+import numpy
 
-# TYPE_INPUT_LAYER = "input"
-# TYPE_OUTPUT_LAYER = "output"
-# TYPE_HIDDEN_LAYER = "hidden"
+__all__= ["loadModel", "Network"]
 
 def loadModel(filename) :
     """Shorthand for Network.load"""
     return Network.load(filename)
 
-class OutputMap(object):
-    """
-    Encapsulates outputs as well as their theano functions.
-    The role of an output map object is to apply a function such as theano_train to the set of outputs it belongs to
-    """
-    def __init__(self, name, network):
-        self.name = name
-        self.network = network
-        self.outputFcts = {}
-
-    def printGraph(self, outputLayer) :
-        """Print the theano graph of the function associated with a given output"""
-        if type(outputLayer) is types.StringType :
-            ol = self.network[outputLayer]
-        else :
-            ol = outputLayer
-
-        self.outputFcts[ol].printGraph()
-
-    def addOutput(self, outputLayer, fct) :
-        self.outputFcts[outputLayer] = fct
-
-    def callTheanoFct(self, outputLayer, **kwargs) :
-        if type(outputLayer) is types.StringType :
-            ol = self.network.layers[outputLayer]
-        else :
-            ol = outputLayer
-
-        return self.outputFcts[ol](**kwargs)
-
-    def __call__(self, outputLayer, **kwargs) :
-        return self.callTheanoFct(outputLayer, **kwargs)
-
-    def __repr__(self) :
-        os = []
-        for o, v in self.outputFcts.iteritems() :
-            os.append(o.name)
-        
-        os = ', '.join(os)
-        return "<theano fct '%s' for layers: '%s'>" % (self.name, os)
-
-class Network(object) :
+class Network(MABS.Logger_ABC) :
     """All theano functions of all layers are accessible through the network interface **network.x(...)**."""
     def __init__(self) :
+        super(Network, self).__init__()
+
         self.inputs = OrderedDict()
         self.layers = OrderedDict()
         self.outputs = OrderedDict()
@@ -66,62 +26,48 @@ class Network(object) :
         
         self.outConnections = OrderedDict()
         self.inConnections = OrderedDict()
+        self.notes = OrderedDict()
 
         self.parameters = []
+        self.parameterStash = {}
 
         self._mustInit = True
-        self.outputMaps = {}
-        self.log = []
+        self.random_seed = MSET.RANDOM_SEED
 
-    def logEvent(self, entity, message, parameters = {}) :
-        "Adds a log event to self.log. Entity can be anything hashable, Message should be a string and parameters and dict: param_name => value"
-        import time, types
-        assert type(message) is types.StringType
-        assert type(parameters) is types.DictType
-            
-        entry = {
-            "date": time.ctime(),
-            "timestamp": time.time(),
-            "message": message,
-            "parameters": parameters,
-            "entity": entity
+        numpy.random.seed(self.random_seed)
+        # self.outputMaps = {}
+
+    def getOutputs(self) :
+        """return network outputs"""
+        return self.outputs
+
+    def getInputs(self) :
+        """return network inputs"""
+        return self.inputs
+
+    def getLog(self) :
+        """get the log"""
+        log = {
+            "network": self.log,
+            "layers": {}
         }
-        self.log.append(entry)
+
+        for name, l in self.layers.iteritems() :
+            log["layers"][name]  = l.getLog()
+
+        return log
+
+    def addNote(self, title, text) :
+        """add a note"""
+        self.notes[title] = text
+
+    def getInConnections(self, layer) :
+        """return a layer's incoming connections"""
+        return list(self.inConnections[layer])
     
-    def logNetworkEvent(self, message, parameters = {}) :
-        self.logEvent("Network", message, parameters)
-
-    def logLayerEvent(self, layer, message, parameters = {}) :
-        "Adds a log event to self.log. Message should be a string and parameters and dict: param_name => value"
-        import time, types
-        assert type(message) is types.StringType
-        assert type(parameters) is types.DictType
-        self.logEvent(layer.name, message, parameters)
-
-    def printLog(self) :
-        "Print a very pretty version of self.log. The log should contain all meaningful events in a chronological order"
-        
-        errMsg = ""
-        try :
-            self.init()
-        except Exception as e :
-            errMsg = "----OUCH----\nUnable to initialize network: %s\n------------" % e
-
-        t = " The story of how it all began "
-        t = "="*len(t) + "\n" + t + "\n" + "="*len(t)
-        
-        es = []
-        for e in self.log :
-            ps = []
-            for param, value in e["parameters"].iteritems() :
-                ps.append( "    -%s: %s" % (param, value) )
-            ps = '\n' + '\n'.join(ps)
-            # es.append("-[%s]@%s(%s), %s.\n%s" % (e["entity"], e["timestamp"], e["date"], e["message"], ps))
-            es.append("-@%s(%s):\n  %s -> %s.%s" % (e["timestamp"], e["date"], e["entity"], e["message"], ps))
-            
-        es = '\n'.join(es)
-
-        print "\n" + t + "\n\n" + es + "\n" + errMsg + "\n"
+    def getOutConnections(self, layer) :
+        """return a layer's out connections"""
+        return list(self.outConnections[layer])
 
     def _addEdge(self, layer1Name, layer2Name) :
         """Add a connection between two layers"""
@@ -141,7 +87,7 @@ class Network(object) :
         except :
             self.inConnections[layer2] = set([layer1])
 
-        self.logNetworkEvent("New edge %s > %s" % (layer1.name, layer2.name))
+        self.logEvent("New edge %s > %s" % (layer1.name, layer2.name))
 
     def getSortedInConnections(self, layer) :
         """Returns a layer's inner connections sorted in alphetical order"""
@@ -180,19 +126,10 @@ class Network(object) :
                 self.inConnections[h] = set()
                 self.outConnections[h] = set()
 
-        # if MSET.TYPE_INPUT_LAYER in h.types:
-        #     self.inputs[h.name] = h
-        #     self.logNetworkEvent("New Input layer %s" % (h.name))
-        # elif MSET.TYPE_OUTPUT_LAYER in h.types :
-        #     self.outputs[h.name] = h
-        #     self.logNetworkEvent("New Output layer %s" % (h.name))
-        # else :
-        #     self.logNetworkEvent("New Hidden layer %s" % (h.name))
-
     def merge(self, fromLayer, toLayer) :
         """Merges the networks of two layers together. fromLayer must be part of the self"""
         
-        self.logNetworkEvent("Merging nets: %s and %s" % (fromLayer.name, toLayer.name))
+        self.logEvent("Merging nets: %s and %s" % (fromLayer.name, toLayer.name))
 
         if fromLayer.name not in self.layers :
             raise ValueError("from layer '%s' is not part of this network" % fromLayer.name)
@@ -209,19 +146,10 @@ class Network(object) :
         for l in newLayers :
             l.network = self
 
-        self.inputs = OrderedDict()
-        self.outputs = OrderedDict()
         for name, layer in self.layers.iteritems() :
-            if MSET.TYPE_INPUT_LAYER in layer.types:
-                self.inputs[layer.name] = layer
-                self.logNetworkEvent("Registering Input layer %s" % (layer.name))
-            if MSET.TYPE_OUTPUT_LAYER in layer.types :
-                self.outputs[layer.name] = layer
-                self.logNetworkEvent("Registering Output layer %s" % (layer.name))
-            if MSET.TYPE_HIDDEN_LAYER in layer.types :
-                self.logNetworkEvent("Registering Hidden layer %s" % (layer.name))
+            self.logEvent("Registering layer %s" % (layer.name))
 
-    def initParameters(self, forceReset = False) :
+    def initParameters(self) :
         """Initializes the parameters of all layers but does nothing else.
         Call this before tying parameters together::
         
@@ -232,150 +160,126 @@ class Network(object) :
             model.train(...)
         """
         for l in self.layers.itervalues() :
-            l._initParameters(forceReset)
+            l.initParameters()
 
-    def init(self, forceInit=False) :
+    def init(self, force=False) :
         "Initialiases the network by initialising every layer."
-        if self._mustInit or forceInit :
-            self.logNetworkEvent("Initialization begins!")
+        for layer in self.layers.itervalues() :
+            layerTypes = layer.getTypes()
+            if MSET.TYPE_INPUT_LAYER in layerTypes:
+                self.inputs[layer.name] = layer
+            if MSET.TYPE_OUTPUT_LAYER in layerTypes:
+                self.outputs[layer.name] = layer
+        
+        if self._mustInit or force :
+            self.logEvent("Initialization begins!")
             print("\n" + MSET.OMICRON_SIGNATURE)
 
             if len(self.inputs) < 1 :
                 raise ValueError("Network has no inputs")
 
-            self.initParameters(forceReset=False)
-
             for inp in self.inputs.itervalues() :
-                inp._initA()
-    
+                inp._initA(force=True)
+
             for l in self.layers.itervalues() :
-                l._initB()
-                self.parameters.extend(l.getParameters())
+                l._initB(force=True)
+                self.parameters.append(self.getFullParameters())
     
-            for o in self.layers.itervalues() :
-                for k, v in o.__dict__.iteritems() :
-                    if ( v.__class__ is TheanoFunction ) or issubclass(v.__class__, TheanoFunction) :
-                        if k not in self.outputMaps :
-                            self.outputMaps[k] = OutputMap(k, self)
-                        self.outputMaps[k].addOutput(o, v)
-            
             self._mustInit = False
+    
+        noInit = []
+        for l in self.layers.itervalues() :
+            if not l.isInit() :
+                noInit.append(l)
+
+        if len(noInit) > 0 :
+            raise AttributeError("These layers have not been initialized (please check network connectivity): %s" % str(noInit))
+
+    def reasignInputs(self, layerNameList) :
+        """Hiddens become the new inputs"""
         
-    def help(self) :
-        """prints the list of available model functions, such as train, test,..."""
-        self.init()
-        os = []
-        for o in self.outputMaps.itervalues() :
-            os.append(repr(o))
-        os = '\n\t'.join(os)
+        self.logEvent("Reinitializating for input reasignement")
+        if self._mustInit :
+            self.init(force=True)
 
-        print "Available model functions:\n%s\n" % os
-
-    @classmethod
-    def isLayer(cls, obj) :
-        try :
-            return obj.isLayer
-        except AttributeError :
-            return False
-
+        check = set()
+        for name in layerNameList :
+            if name not in check :
+                self.logEvent("Reasigning %s as an input" % name)
+                inp = self[name]
+                inp._initA(force=True, asReasinedInput=True)
+                check.add(name)
+        
+        for l in self.layers.itervalues() :
+            l._initB(force=True)
+            self.parameters.append(self.getFullParameters())
+    
+        self._mustInit = False
+    
     def save(self, filename) :
-        import cPickle, pickle
-        self.init()
-        
-        ext = '.mar.mdl.pkl'
+        """Save a model on disk"""
+        res = {
+            'network': {
+                "edges": self.edges.keys(),
+                "log": self.log,
+                "notes": self.notes
+            },
+            'layers': {}
+        }
+
+        for l in self.layers.itervalues() :
+            l._resetNetwork(fullReset = False)
+            res["layers"][l.name] = l
+                
+        ext = '.mar'
         if filename.find(ext) < 0 :
             fn = filename + ext
         else :
             fn = filename
 
-        res = {
-            "edges": self.edges.keys(),
-            "log": self.log,
-            "layers": {}
-        }
-        
-        for l in self.layers.itervalues() :
-            sumary = {
-                "class": l.__class__,
-                "arguments": {
-                    "args": [],
-                    "kwargs": {}
-                },
-                "parameters": {},
-                "needs": set()
-            }
-
-            for v in l.creationArguments["args"] :
-                if self.isLayer(v) :
-                    if v.name not in self.layers :
-                        raise ValueError("Unable to save, layer '%s' is an argument to layer '%s' but is not part of the network" % (v.name, l.name))
-                    sumary["arguments"]["args"].append("MARLAYER.%s" % v.name)
-                    sumary["needs"].add(v.name)
-                else :
-                    sumary["arguments"]["args"].append(v)
-
-            for k, v in l.creationArguments["kwargs"].iteritems() :
-                if self.isLayer(v) :
-                    if v.name not in self.layers :
-                        raise ValueError("Unable to save, layer '%s' is an argument to layer '%s' but is not part of the network" % (v.name, l.name))
-                    sumary["arguments"]["kwargs"][k] = "MARLAYER.%s" % v.name
-                    sumary["needs"].add(v.name)
-                else :
-                    sumary["arguments"]["kwargs"][k] = v
-
-            for k, v in l.getParameterDict().iteritems() :
-                sumary["parameters"][k] = v
-
-            res["layers"][l.name] = sumary
-
         f = open(fn, 'wb', pickle.HIGHEST_PROTOCOL)
         cPickle.dump(res, f)
         f.close()
 
+        for l in self.layers.itervalues() :
+            l._resetNetwork(fullReset = False, newNetwork = self)
+
     @classmethod
     def load(cls, filename) :
-        """Loads a model from disk"""
-        import cPickle
-
-        # ext = '.mar.mdl.pkl'
-        # if filename.find(ext) < 0 :
-        #     fn = filename + ext
-        # else :
-        #     fn = filename
-
-        f = open(filename)
-        model = cPickle.load(f)
-        expandedLayers = {}
-        while len(expandedLayers) < len(model["layers"]) :
-            for name, stuff in model["layers"].iteritems() :
-                if name not in expandedLayers :
-                    if len(stuff["needs"]) == 0 :
-                        expandedLayers[name] = stuff["class"](*stuff["arguments"]["args"], **stuff["arguments"]["kwargs"])
-                    else :
-                        if len(stuff["needs"] - set(expandedLayers.keys())) == 0 :
-                            for i, v in enumerate(stuff["arguments"]["args"]) :
-                                if type(v) == types.StringType and v.find("MARLAYER") == 0 :
-                                    stuff["arguments"]["args"][i] = expandedLayers[v.split(".")[1]]
-
-                            for k, v in stuff["arguments"]["kwargs"].iteritems() :
-                                if type(v) == types.StringType and v.find("MARLAYER") == 0 :
-                                    stuff["arguments"]["kwargs"][k] = expandedLayers[v.split(".")[1]]
-                            
-                            expandedLayers[name] = stuff["class"](*stuff["arguments"]["args"], **stuff["arguments"]["kwargs"])
-
-        for l in expandedLayers.itervalues() :
-            for k, v in model["layers"][l.name]["parameters"].iteritems() :
-                try:
-                    l.updateParameter(k, v)
-                except :
-                    l.initParameter(k, v)
-            l._mustReset = False
-           
-        for l1, l2 in model["edges"] :
-            network = expandedLayers[l1] > expandedLayers[l2]
+        """Load a model from disk"""
         
+        f = open(filename)
+        pkl = cPickle.load(f)
+        f.close()
+
+        for l1, l2 in pkl["network"]["edges"] :
+            network = pkl["layers"][l1] > pkl["layers"][l2]
+
+        network.log = pkl["network"]["log"]
+        network.notes = pkl["network"]["notes"]
+
         return network
-                
+
+    def toInputs(self, toConvert) :
+        """returns a similar network with layers in toConvert transformed as inputs, toConvert must be a list of layer names."""
+        layers = {}
+
+        for l in self.layers.itervalues() :
+            if l.name in toConvert :
+                ll = l.toInput()
+            else :
+                ll = l.clone()
+
+            layers[l.name] = ll
+
+        for l1, l2 in self.edges() :
+            network = layers[l1] > layers[l2]
+        
+        # network.log = self.log
+        # network.notes = self.notes
+
+        return network
+
     def toDOT(self, name, forceInit = True) :
         """returns a string representing the network in the DOT language.
         If forceInit, the network will first try to initialize each layer
@@ -408,8 +312,116 @@ class Network(object) :
 
         return s
 
-    def saveHTML(self, name, forceInit = True) :
-        """Creates an HTML file with the graph representation. Heavily inspired from: http://stackoverflow.com/questions/22595493/reading-dot-files-in-javascript-d3"""
+    def toDictionary(self, name) :
+        """return a dict representation of the network"""
+        def do(dct, layer, level) :
+            dct[layer.name] = layer.toDictionary()
+            dct[layer.name]["level"] = level
+            for  lin in self.inConnections[layer] :
+                if lin.name in dct :
+                    dct[layer.name]["level"] = max(dct[lin.name]["level"]+1, dct[layer.name]["level"])
+             
+            dct[layer.name]["abstractions"] = OrderedDict()
+            for k, v in layer.abstractions.iteritems() :
+                dct[layer.name]["abstractions"][k] = OrderedDict()
+                if type(v) is list :
+                    for vv in v :
+                        dct[layer.name]["abstractions"][k][vv.__class__.__name__] = vv.toDictionary()
+                else :
+                    dct[layer.name]["abstractions"][k][v.__class__.__name__] = v.toDictionary()
+
+            for l2 in self.outConnections[layer] :
+                dct.update(do(dct, l2, level+1) )
+            
+            return dct
+
+        res = {}
+        res["layers"] = OrderedDict()
+
+        levels = {}
+        for layerName, layer in self.inputs.iteritems() :
+            res["layers"].update(do(res["layers"], layer, 0))
+
+        res["edges"] = []
+        for t, f in self.edges.iterkeys() :
+            res["edges"].append({"from": t, "to": f})
+
+        res["name"] = name
+        res["notes"] = self.notes
+
+        return res
+
+    def getFullParameters(self) :
+        """get all model parameters"""
+        if self._mustInit :
+            params = {}
+            for layer in self.layers.itervalues() :
+                for k, v in layer.getFullParameters().iteritems() :
+                    params["%s.%s" % (layer.name, k)] = v
+            return params
+        else :
+            return self.parameters
+
+    def stashParameters(self, stashName, forceReset=False) :
+        import numpy
+        """Saves parameters in memory"""
+        if stashName not in self.parameterStash or forceReset :
+            self.parameterStash[stashName] = {}
+            for k, v in self.getFullParameters().iteritems() :
+                if v.isShared() :
+                    self.parameterStash[stashName][k] = v.getValue()
+        else :
+            params = self.getFullParameters()
+            for k in self.parameterStash[stashName].iterkeys() :
+                self.parameterStash[stashName][k] = params[k].getValue()
+
+    def applyStash(self, stashName) :
+        """set parameters to stash values"""
+        params = self.getFullParameters()
+        for k, v in self.parameterStash[stashName].iteritems() :
+            params[k].setValue(v)
+        self._mustInit = True
+
+    def saveStash(self, modelName, stashName) :
+        """Saves stashed parameters to disk"""
+        fn = "%s-%s.stash.mar.pkl" %(modelName, stashName)
+        f = open(fn, 'wb', pickle.HIGHEST_PROTOCOL)
+        cPickle.dump(self.parameterStash[stashName], f)
+        f.close()
+
+    def loadStash(self, filename) :
+        """Load a stash from disk"""
+        f = open(filename)
+        stash = cPickle.load(f)
+        f.close()
+
+        return stash
+
+    def dropStash(self, stashName) :
+        """drops a stash"""
+        del self.parameterStash[stashName]
+
+    def earseAllStashes(self) :
+        """erases all stashes"""
+        self.parameterStash = {}
+
+    def toJson(self, name, pretty=True) :
+        import json
+        """return a json representation of the network"""
+        if pretty :
+            return json.dumps(self.toDictionary(name), indent=2, sort_keys=True)
+    
+        return json.dumps(self.toDictionary(name))
+
+    def saveHTML(self, name, init=True) :
+        from Mariana.HTML_Templates.vulcan.vulcan import Vulcan
+        if init :
+            self.init()
+        template = Vulcan()
+        template.render(name, self.toDictionary(name))
+
+    def saveHTML_old(self, name, forceInit = True) :
+        """Creates an HTML file with the graph representation."""
         from Mariana.HTML_Templates.aqua import getHTML
         import time
         temp = getHTML(self.toDOT(name, forceInit), name, time.ctime())
@@ -423,32 +435,42 @@ class Network(object) :
         f.write(self.toDOT(name, forceInit))
         f.close()
 
+    def __contains__(self, layerName) :
+        """Is there a layer by that name"""
+        return layerName in self.layers
+
     def __getitem__(self, l) :
         """get a layer by name"""
-        return self.layers[l]
+        try :
+            return self.layers[l]
+        except KeyError :
+            raise KeyError("There's no layer named: '%s'" % l)
 
     def __repr__(self) :
-        return "<Net (%s layers): %s > ... > [%s]>" % (len(self.layers), self.inputs.keys(), self.outputs.keys())
+        if self._mustInit :
+            return "< Mariana Network (not initialized) (%s layers) >" % (len(self.layers))
+        else :
+            return "< Mariana Network (%s layers): %s > ... > [%s] >" % (len(self.layers), self.inputs.keys(), self.outputs.keys())
 
-    def __getattribute__(self, k) :
-        """
-        All theano functions are accessible through the network interface network.x(). Here x is called a model function.
-        """
-        try :
-            return object.__getattribute__(self, k)
-        except AttributeError as e :
-            # a bit too hacky, but solves the following: Pickle asks for attribute not found in networks which triggers initializations
-            # of free outputs, and then theano complains that the layer.outputs are None, and everything crashes miserably. 
-            if k == "__getstate__" or k == "__slots__" :
-                raise e
+    # def __getattribute__(self, k) :
+    #     """
+    #     All theano functions are accessible through the network interface network.x(). Here x is called a model function.
+    #     """
+    #     try :
+    #         return object.__getattribute__(self, k)
+    #     except AttributeError as e :
+    #         # a bit too hacky, but solves the following: Pickle asks for attribute not found in networks which triggers initializations
+    #         # of free outputs, and then theano complains that the layer.outputs are None, and everything crashes miserably. 
+    #         if k == "__getstate__" or k == "__slots__" :
+    #             raise e
             
-            outs = object.__getattribute__(self, 'outputs')
-            init = object.__getattribute__(self, 'init')
-            init()
+    #         outs = object.__getattribute__(self, 'outputs')
+    #         init = object.__getattribute__(self, 'init')
+    #         init()
 
-            maps = object.__getattribute__(self, 'outputMaps')
-            try :
-                return maps[k]
-            except KeyError :
-                raise e
+    #         maps = object.__getattribute__(self, 'outputMaps')
+    #         try :
+    #             return maps[k]
+    #         except KeyError :
+    #             raise e
     

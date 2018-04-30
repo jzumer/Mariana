@@ -3,13 +3,14 @@
    You can adapt this file completely to your liking, but it should at least
    contain the root `toctree` directive.
 
-Mariana: The Cutest Deep Learning Framework
-===========================================
+Mariana: Deep Neural Networks should be Easy to Write
+=====================================================
 .. image:: https://img.shields.io/badge/python-2.7-blue.svg 
 
 Mariana's goal is to create a powerful language through which complex deep neural networks can be meaningfully expressed and easily manipulated. It's here to empower researchers, teachers and students, while greatly facilitating AI knowledge transfer into other domains
 
 Mariana is a Python Machine Learning Framework built on top of Theano_. She Mariana lives on github_.
+
 
 .. _Theano: http://www.deeplearning.net/software/theano/
 .. _github: https://github.com/tariqdaouda/Mariana/

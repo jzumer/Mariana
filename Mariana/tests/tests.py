@@ -11,12 +11,18 @@ import Mariana.activations as MA
 import theano.tensor as tt
 import numpy
 
-class Hidden_layerRef(ML.Hidden) :
+def getMLP(self, nbInputs=2, nbClasses=2) :
+    ls = MS.GradientDescent(lr = 0.1)
+    cost = MC.NegativeLogLikelihood()
 
-    def __init__(self, otherLayer, *args, **kwargs) :
-        ML.Hidden.__init__(self, *args, **kwargs)
-        self.otherLayer = otherLayer
+    i = ML.Input(nbInputs, 'inp')
+    h = ML.Hidden(size = 6, activation = MA.ReLU(), name = "Hidden_0.500705866892")
+    o = ML.SoftmaxClassifier(nbClasses=nbClasses, cost=cost, learningScenari=[ls], name = "out")
 
+    mlp = i > h > o
+    mlp.init()
+    return mlp
+    
 class MLPTests(unittest.TestCase):
 
     def setUp(self) :
@@ -35,171 +41,209 @@ class MLPTests(unittest.TestCase):
         pass
 
     def trainMLP_xor(self) :
-        ls = MS.GradientDescent(lr = 0.1)
-        cost = MC.NegativeLogLikelihood()
+        mlp = getMLP(2, 2)
 
-        i = ML.Input(2, 'inp')
-        h = ML.Hidden(10, activation = MA.ReLU(), name = "Hidden_0.500705866892")
-        o = ML.SoftmaxClassifier(2, learningScenario = ls, costObject = cost, name = "out")
-
-        mlp = i > h > o
-        
         self.xor_ins = numpy.array(self.xor_ins)
         self.xor_outs = numpy.array(self.xor_outs)
         for i in xrange(1000) :
-            mlp.train(o, inp = self.xor_ins, targets = self.xor_outs )
-            # print mlp.propagateTest(o, inp = self.xor_ins)
-
+            mlp["out"].train({"inp.inputs": self.xor_ins, "out.targets" : self.xor_outs} )
+        
         return mlp
+
+    # @unittest.skip("skipping")
+    def test_missing_args(self) :
+        mlp = getMLP(2, 2)
+        self.assertRaises(SyntaxError, mlp["out"].train, {} )
+    
+    # @unittest.skip("skipping")
+    def test_unexpected_args(self) :
+        mlp = getMLP(2, 2)
+        self.assertRaises( SyntaxError, mlp["out"].train, {"inp.inputs": self.xor_ins, "out.targets" : self.xor_outs, "lala": 0} )
 
     # @unittest.skip("skipping")
     def test_xor(self) :
         mlp = self.trainMLP_xor()
-        o = mlp.outputs.values()[0]
 
-        pa = mlp.predictionAccuracy(o, inp = self.xor_ins, targets = self.xor_outs )["accuracy"]
+        pa = mlp["out"].accuracy["train"]({"inp.inputs": self.xor_ins, "out.targets" : self.xor_outs})["out.accuracy.train"]
         self.assertEqual(pa, 1)
-        pc = mlp.classificationAccuracy(o, inp = self.xor_ins, targets = self.xor_outs )["accuracy"]
+        pc = mlp["out"].accuracy["test"]({"inp.inputs": self.xor_ins, "out.targets" : self.xor_outs})["out.accuracy.test"]
         self.assertEqual(pc, 1)
         
-        self.assertEqual(mlp.classify( o, inp = [ self.xor_ins[0] ] )["class"], 0 )
-        self.assertEqual(mlp.classify( o, inp = [ self.xor_ins[1] ] )["class"], 1 )
-        self.assertEqual(mlp.classify( o, inp = [ self.xor_ins[2] ] )["class"], 1 )
-        self.assertEqual(mlp.classify( o, inp = [ self.xor_ins[3] ] )["class"], 0 )
-
+        for i in xrange(len(self.xor_ins)) :
+            self.assertEqual(mlp["out"].predict["test"]( {"inp.inputs": [self.xor_ins[i]]} )["out.predict.test"], self.xor_outs[i] )
+        
     # @unittest.skip("skipping")
-    def test_save_load(self) :
+    def test_save_load_64h(self) :
         import os
         import Mariana.network as MN
 
-        ls = MS.GradientDescent(lr = 0.1)
+        ls = MS.GradientDescent(lr = 0.1, momentum=0.9)
+        # ls = MS.Adagrad()
         cost = MC.NegativeLogLikelihood()
 
         i = ML.Input(2, 'inp')
-        h = Hidden_layerRef(i, 10, activation = MA.ReLU(), name = "Hidden_0.500705866892")
-        o = ML.SoftmaxClassifier(2, learningScenario = ls, costObject = cost, name = "out")
+        o = ML.SoftmaxClassifier(nbClasses=2, cost=cost, learningScenari=[ls], name = "out")
 
-        mlp = i > h > o
+        prev = i
+        for i in xrange(64) :
+            h = ML.Hidden(size=10, activation = MA.ReLU(), name = "Hidden_%s" %i)
+            prev > h
+            prev = h
         
-        self.xor_ins = numpy.array(self.xor_ins)
-        self.xor_outs = numpy.array(self.xor_outs)
-        for i in xrange(1000) :
-            mlp.train(o, inp = self.xor_ins, targets = self.xor_outs )
-
+        mlp = prev > o
+        mlp.init()
         mlp.save("test_save")
-        mlp2 = MN.loadModel("test_save.mar.mdl.pkl")
         
-        o = mlp.outputs.values()[0]
+        mlp2 = MN.loadModel("test_save.mar")
+        mlp2.init()
         
-        v1 = mlp.propagate( o.name, inp = self.xor_ins )["outputs"]
-        v2 = mlp2.propagate( o.name, inp = self.xor_ins )["outputs"]
-        self.assertEqual(numpy.sum(v1), numpy.sum(v2))
-        self.assertEqual(mlp["Hidden_0.500705866892"].otherLayer.name, mlp2["Hidden_0.500705866892"].otherLayer.name)
+        for i in xrange(100) :
+            mlp["out"].train( {"inp.inputs": self.xor_ins, "out.targets": self.xor_outs} )
         
-        os.remove('test_save.mar.mdl.pkl')
-
-    # @unittest.skip("skipping")
-    def test_ae(self) :
-
-        data = []
-        for i in xrange(8) :
-            zeros = numpy.zeros(8)
-            zeros[i] = 1
-            data.append(zeros)
-
-        ls = MS.GradientDescent(lr = 0.1)
-        cost = MC.MeanSquaredError()
-
-        i = ML.Input(8, name = 'inp')
-        h = ML.Hidden(3, activation = MA.ReLU(), initializations=[MI.SmallUniformWeights(), MI.ZeroBias()], name = "hid")
-        o = ML.Autoencode(targetLayerName = "inp", activation = MA.ReLU(), initializations=[MI.SmallUniformWeights(), MI.ZeroBias()], learningScenario = ls, costObject = cost, name = "out" )
-
-        ae = i > h > o
-
-        miniBatchSize = 1
-        for e in xrange(2000) :
-            for i in xrange(0, len(data), miniBatchSize) :
-                ae.train(o, inp = data[i:i+miniBatchSize])
-
-        res = ae.propagate(o, inp = data)["outputs"]
-        for i in xrange(len(res)) :
-            self.assertEqual( numpy.argmax(data[i]), numpy.argmax(res[i]))
+        for i in xrange(100) :
+            mlp2["out"].train( {"inp.inputs": self.xor_ins, "out.targets": self.xor_outs} )
+        
+        v1 = mlp["out"].propagate["test"]( {"inp.inputs": self.xor_ins} )["out.propagate.test"]
+        v2 = mlp2["out"].propagate["test"]( {"inp.inputs": self.xor_ins} )["out.propagate.test"]
+        self.assertTrue((v1==v2).all())
+        os.remove('test_save.mar')
 
     # @unittest.skip("skipping")
     def test_ae_reg(self) :
+        powerOf2 = 3
+        nbUnits = 2**powerOf2
 
         data = []
-        for i in xrange(8) :
-            zeros = numpy.zeros(8)
+        for i in xrange(nbUnits) :
+            zeros = numpy.zeros(nbUnits)
             zeros[i] = 1
             data.append(zeros)
 
         ls = MS.GradientDescent(lr = 0.1)
         cost = MC.MeanSquaredError()
 
-        i = ML.Input(8, name = 'inp')
-        h = ML.Hidden(3, activation = MA.ReLU(), initializations=[MI.SmallUniformWeights(), MI.ZeroBias()], name = "hid")
-        o = ML.Regression(8, activation = MA.ReLU(), initializations=[MI.SmallUniformWeights(), MI.ZeroBias()], learningScenario = ls, costObject = cost, name = "out" )
+        i = ML.Input(nbUnits, name = 'inp')
+        h = ML.Hidden(powerOf2, activation = MA.ReLU(), initializations=[MI.Uniform('W', small=True), MI.SingleValue('b', 0)], name = "hid")
+        o = ML.Regression(nbUnits, activation = MA.ReLU(), initializations=[MI.Uniform('W', small=True), MI.SingleValue('b', 0)], learningScenari = [ls], cost = cost, name = "out" )
 
         ae = i > h > o
-
+        ae.init()
+        
         miniBatchSize = 1
         for e in xrange(2000) :
             for i in xrange(0, len(data), miniBatchSize) :
-                ae.train(o, inp = data[i:i+miniBatchSize], targets = data[i:i+miniBatchSize] )
-
-        res = ae.propagate(o, inp = data)["outputs"]
+                miniBatch = data[i:i+miniBatchSize]
+                ae["out"].train({"inp.inputs": miniBatch, "out.targets":miniBatch} )["out.drive.train"]
+                
+        res = ae["out"].propagate["test"]({"inp.inputs": data})["out.propagate.test"]
         for i in xrange(len(res)) :
             self.assertEqual( numpy.argmax(data[i]), numpy.argmax(res[i]))
 
     # @unittest.skip("skipping")
-    def test_composite(self) :
+    def test_ae(self) :
+        powerOf2 = 3
+        nbUnits = 2**powerOf2
+
+        data = []
+        for i in xrange(nbUnits) :
+            zeros = numpy.zeros(nbUnits)
+            zeros[i] = 1
+            data.append(zeros)
+
+        ls = MS.GradientDescent(lr = 0.1)
+        cost = MC.MeanSquaredError()
+
+        i = ML.Input(nbUnits, name = 'inp')
+        h = ML.Hidden(powerOf2, activation = MA.ReLU(), initializations=[MI.Uniform('W', small=True), MI.SingleValue('b', 0)], name = "hid")
+        o = ML.Autoencode(targetLayer=i, activation = MA.ReLU(), initializations=[MI.Uniform('W', small=True), MI.SingleValue('b', 0)], learningScenari = [ls], cost = cost, name = "out" )
+
+        ae = i > h > o
+        ae.init()
+        
+        miniBatchSize = 1
+        for e in xrange(2000) :
+            for i in xrange(0, len(data), miniBatchSize) :
+                miniBatch = data[i:i+miniBatchSize]
+                loss = ae["out"].train({"inp.inputs": miniBatch} )["out.drive.train"]
+                
+        res = ae["out"].propagate["test"]({"inp.inputs": data})["out.propagate.test"]
+        for i in xrange(len(res)) :
+            self.assertEqual( numpy.argmax(data[i]), numpy.argmax(res[i]))
+    
+    # @unittest.skip("skipping")
+    def test_multiout_fctmixin(self) :
+        
+        i = ML.Input(1, name = 'inp')
+        o1 = ML.Autoencode(targetLayer=i, activation = MA.Tanh(), learningScenari = [MS.GradientDescent(lr = 0.1)], cost = MC.MeanSquaredError(), name = "out1" )
+        o2 = ML.Regression(1, activation = MA.Tanh(), learningScenari = [MS.GradientDescent(lr = 0.2)], cost = MC.MeanSquaredError(), name = "out2" )
+
+        i  > o1
+        ae = i > o2
+        ae.init()
+ 
+        preOut1 = ae["out1"].test( {"inp.inputs": [[1]]} )["out1.drive.test"]
+        preOut2 = ae["out2"].test( {"inp.inputs": [[1]], "out2.targets": [[1]]} )["out2.drive.test"]
+        ae["out1"].train({"inp.inputs": [[1]]} )["out1.drive.train"]
+        self.assertTrue( preOut1 > ae["out1"].test( {"inp.inputs": [[1]]} )["out1.drive.test"] )
+        self.assertTrue( preOut2 == ae["out2"].test( {"inp.inputs": [[1]], "out2.targets": [[1]]} )["out2.drive.test"] )
+
+        preOut1 = ae["out1"].test( {"inp.inputs": [[1]]} )["out1.drive.test"]
+        preOut2 = ae["out2"].test( {"inp.inputs": [[1]], "out2.targets": [[1]]} )["out2.drive.test"]
+        ae["out2"].train({"inp.inputs": [[1]], "out2.targets": [[1]]} )["out2.drive.train"]
+        self.assertTrue( preOut1 == ae["out1"].test( {"inp.inputs": [[1]]} )["out1.drive.test"] )
+        self.assertTrue( preOut2 > ae["out2"].test( {"inp.inputs": [[1]], "out2.targets": [[1]]} )["out2.drive.test"] )
+
+        preOut1 = ae["out1"].test( {"inp.inputs": [[1]]} )["out1.drive.test"]
+        preOut2 = ae["out2"].test( {"inp.inputs": [[1]], "out2.targets": [[1]]} )["out2.drive.test"]
+        fct = ae["out1"].train + ae["out2"].train + ae["inp"].propagate["train"]
+        ret = fct( {"inp.inputs": [[1]], "out2.targets": [[1]]} )
+        self.assertEqual( len(ret), 3)
+        self.assertTrue( preOut1 > ae["out1"].test( {"inp.inputs": [[1]]} )["out1.drive.test"] )
+        self.assertTrue( preOut2 > ae["out2"].test( {"inp.inputs": [[1]], "out2.targets": [[1]]} )["out2.drive.test"] )
+        
+    # @unittest.skip("skipping")
+    def test_concatenation(self) :
         ls = MS.GradientDescent(lr = 0.1)
         cost = MC.NegativeLogLikelihood()
 
         inp = ML.Input(2, 'inp')
         h1 = ML.Hidden(5, activation = MA.Tanh(), name = "h1")
         h2 = ML.Hidden(5, activation = MA.Tanh(), name = "h2")
-        o = ML.SoftmaxClassifier(2, learningScenario = ls, costObject = cost, name = "out")
-        c = ML.Composite(name = "Comp")
-
-        inp > h1 > c
-        inp > h2 > c
+        o = ML.SoftmaxClassifier(nbClasses=2, cost=cost, learningScenari=[ls], name = "out")
+        
+        inp > h1
+        inp > h2
+        c = ML.C([h1, h2], name="concat")
         mlp = c > o
+        mlp.init()
 
+        self.assertEqual( c.getIntrinsicShape()[0], h1.getIntrinsicShape()[0] + h2.getIntrinsicShape()[0])
         for i in xrange(10000) :
             ii = i%len(self.xor_ins)
-            mlp.train(o, inp = [ self.xor_ins[ ii ] ], targets = [ self.xor_outs[ ii ] ])
+            miniBatch = [ self.xor_ins[ ii ] ]
+            targets = [ self.xor_outs[ ii ] ]
+            mlp["out"].train({"inp.inputs": miniBatch, "out.targets":targets} )["out.drive.train"]
 
-        self.assertEqual(mlp.predict( o, inp = [ self.xor_ins[0] ] )["class"], 0 )
-        self.assertEqual(mlp.predict( o, inp = [ self.xor_ins[1] ] )["class"], 1 )
-        self.assertEqual(mlp.predict( o, inp = [ self.xor_ins[2] ] )["class"], 1 )
-        self.assertEqual(mlp.predict( o, inp = [ self.xor_ins[3] ] )["class"], 0 )
+        for i in xrange(len(self.xor_ins)) :
+            self.assertEqual(mlp["out"].predict["test"]( {"inp.inputs": [self.xor_ins[i]]} )["out.predict.test"], self.xor_outs[i] )
 
     # @unittest.skip("skipping")
-    def test_multiinputs(self) :
+    def test_merge(self) :
         ls = MS.GradientDescent(lr = 0.1)
+        cost = MC.NegativeLogLikelihood()
 
-        inpA = ML.Embedding(size=2, nbDimentions=2, dictSize=2, name="IA")
-        inpB = ML.Input(2, name="IB")
-        inpNexus = ML.Composite(name = "InputNexus")
+        inp1 = ML.Input(1, 'inp1')
+        inp2 = ML.Input(1, 'inp2')
+        merge = ML.M((inp1 + inp2) / 3 * 10 -1, name = "merge")
 
-        h1 = ML.Hidden(32, activation = MA.ReLU(), decorators = [], regularizations = [], name = "Fully-connected1" )
-        
-        o = ML.Regression(2,
-            decorators = [],
-            activation=MA.ReLU(),
-            learningScenario = ls,
-            costObject = MC.CrossEntropy(),
-            name = "Out",
-            regularizations = []
-        )
+        inp1 > merge
+        mdl = inp2 > merge
+        mdl.init()
 
-        inpA > inpNexus
-        inpB > inpNexus
-        m = inpNexus > h1 > o
-        m.init()
-
+        self.assertEqual( merge.getIntrinsicShape(), inp1.getIntrinsicShape())
+        v = mdl["merge"].propagate["test"]({"inp1.inputs": [[1]],"inp2.inputs": [[8]]} )["merge.propagate.test"]
+        self.assertEqual(v, 29)
+    
     # @unittest.skip("skipping")
     def test_embedding(self) :
         """the first 3 and the last 3 should be diametrically opposed"""
@@ -208,62 +252,97 @@ class MLPTests(unittest.TestCase):
 
         ls = MS.GradientDescent(lr = 0.5)
         cost = MC.NegativeLogLikelihood()
-
-        emb = ML.Embedding(size=1, nbDimentions=2, dictSize=len(data), learningScenario = ls, name="emb")
-        o = ML.SoftmaxClassifier(2, learningScenario = MS.Fixed(), costObject = cost, name = "out")
-        net = emb > o
         
+        inp = ML.Input(1, 'inp')
+        emb = ML.Embedding(nbDimensions=2, dictSize=len(data), learningScenari = [ls], name="emb")
+        o = ML.SoftmaxClassifier(2, learningScenari = [MS.Fixed()], cost = cost, name = "out")
+        net = inp > emb > o
+        net.init()
+
         miniBatchSize = 2
         for i in xrange(2000) :
             for i in xrange(0, len(data), miniBatchSize) :
-                net.train(o, emb=data[i:i+miniBatchSize], targets=targets[i:i+miniBatchSize])
-        
-        embeddings = emb.getEmbeddings()
+                net["out"].train({"inp.inputs": data[i:i+miniBatchSize], "out.targets":targets[i:i+miniBatchSize]} )["out.drive.train"]
+
+        embeddings = emb.getP("embeddings").getValue()
         for i in xrange(0, len(data)/2) :
             v = numpy.dot(embeddings[i], embeddings[i+len(data)/2])
             self.assertTrue(v < -1)
 
     # @unittest.skip("skipping")
-    def test_conv(self) :
+    def test_optimizer_override(self) :
+        
+        ls = MS.GradientDescent(lr = 0.5)
+        cost = MC.NegativeLogLikelihood()
+        
+        inp = ML.Input(1, 'inp')
+        h = ML.Hidden(5, activation = MA.Tanh(), learningScenari = [MS.Fixed("b")], name = "h")
+        o = ML.SoftmaxClassifier(2, learningScenari = [MS.GradientDescent(lr = 0.5), MS.Fixed("W")], cost = cost, name = "out")
+        net = inp > h > o
+        net.init()
+
+        ow = o.getP('W').getValue()
+        ob = o.getP('b').getValue()
+        hw = h.getP('W').getValue()
+        hb = h.getP('b').getValue()
+        for x in xrange(100):
+            net["out"].train({"inp.inputs": [[1]], "out.targets":[1]} )["out.drive.train"]
+        
+        self.assertTrue(sum(ow[0]) == sum(o.getP('W').getValue()[0]) )
+        self.assertTrue(sum(ob) != sum(o.getP('b').getValue()) )
+        self.assertTrue(sum(hb) == sum(h.getP('b').getValue()) )
+        self.assertTrue( sum(hw[0]) != sum( h.getP('W').getValue()[0]) )
+
+    # @unittest.skip("skipping")
+    def test_conv_pooling(self) :
         import Mariana.convolution as MCONV
+        import Mariana.sampling as MSAMP
         import theano
 
         def getModel(inpSize, filterWidth) :
             ls = MS.GradientDescent(lr = 0.5)
             cost = MC.NegativeLogLikelihood()
-            
-            pooler = MCONV.MaxPooling2D(1, 2)
 
-            i = ML.Input(inpSize, name = 'inp')
-            ichan = MCONV.InputChanneler(1, inpSize, name = 'inpChan')
+            i = ML.Input((1, 1, inpSize), name = 'inp')
             
             c1 = MCONV.Convolution2D( 
-                nbFilters = 5,
+                numFilters = 5,
                 filterHeight = 1,
                 filterWidth = filterWidth,
                 activation = MA.ReLU(),
-                pooler = pooler,
                 name = "conv1"
             )
 
+            pool1 = MSAMP.MaxPooling2D(
+                poolHeight = 1,
+                poolWidth = 2,
+                name="pool1"
+            )
+
             c2 = MCONV.Convolution2D( 
-                nbFilters = 10,
+                numFilters = 10,
                 filterHeight = 1,
                 filterWidth = filterWidth,
                 activation = MA.ReLU(),
-                pooler = pooler,
                 name = "conv2"
             )
 
-            f = MCONV.Flatten(name = "flat")
-            h = ML.Hidden(5, activation = MA.ReLU(), decorators = [], regularizations = [ ], name = "hid" )
-            o = ML.SoftmaxClassifier(2, decorators = [], learningScenario = ls, costObject = cost, name = "out", regularizations = [ ] )
+            pool2 = MSAMP.MaxPooling2D(
+                poolHeight = 1,
+                poolWidth = 2,
+                name="pool2"
+            )
+
+            h = ML.Hidden(5, activation = MA.ReLU(), name = "hid" )
+            o = ML.SoftmaxClassifier(nbClasses=2, cost=cost, learningScenari=[ls], name = "out")
             
-            model = i > ichan > c1 > c2 > f > h > o
+            model = i > c1 > pool1 > c2 > pool2 > h > o
+            model.init()
             return model
 
         def makeDataset(nbExamples, size, patternSize) :
-            data = numpy.random.randn(nbExamples, size).astype(theano.config.floatX)
+            """dataset with pattern of 1 randomly inserted"""
+            data = numpy.random.random((nbExamples, 1, 1, size)).astype(theano.config.floatX)
             data = data / numpy.sum(data)
             pattern = numpy.ones(patternSize)
             
@@ -276,7 +355,7 @@ class MLPTests(unittest.TestCase):
                     start = numpy.random.randint(size/2, size - patternSize)
                     targets.append(1)
 
-                data[i][start:start+patternSize] = pattern
+                data[i][0][0][start:start+patternSize] = pattern
 
             targets = numpy.asarray(targets, dtype=theano.config.floatX)
             
@@ -287,12 +366,47 @@ class MLPTests(unittest.TestCase):
         examples, targets = makeDataset(1000, 128, 6)
         model = getModel(128, 3)
         miniBatchSize = 32
+
+        previousValues = {}
+        for layer in ["conv1", "conv2"] :
+            for param in ["W", "b"] :
+                previousValues["%s.%s" % (layer, param)] = model[layer].getP(param).getValue().mean()
+
         for epoch in xrange(100) :
             for i in xrange(0, len(examples), miniBatchSize) :
-                res = model.train("out", inp = examples[i : i +miniBatchSize], targets = targets[i : i +miniBatchSize] )
+                res = model["out"].train({"inp.inputs": examples[i:i+miniBatchSize], "out.targets":targets[i:i+miniBatchSize]} )["out.drive.train"]
         
-        self.assertTrue(res["score"] < 0.1)
+        for layer in ["conv1", "conv2"] :
+            for param in ["W", "b"] :
+                self.assertFalse(previousValues["%s.%s" % (layer, param)] == model[layer].getP(param).getValue().mean() )
 
+        self.assertTrue(res < 0.1)
+
+    @unittest.skip("skipping")
+    def testRecurrences(self) :
+        import Mariana.recurrence as MREC
+        import Mariana.reshaping as MRES
+        
+        ls = MS.GradientDescent(lr = 0.1)
+        cost = MC.NegativeLogLikelihood()
+        
+        # for clas in [MREC.RecurrentDense, MREC.LSTM, MREC.GRU] : 
+        for clas in [MREC.RecurrentDense] : 
+            inp = ML.Input((None, 3), 'inp')
+            r = clas(2, onlyReturnFinal=True, name = "rec")
+            reshape = MRES.Reshape((-1, 2), name="reshape")
+            o = ML.SoftmaxClassifier(2, cost=cost, learningScenari = [MS.GradientDescent(lr = 0.5)], name = "out")
+            net = inp > r > reshape > o
+            net.init()
+            inputs = [ [ [1, 1], [1, 0], [1, 1] ], [ [1, 0], [0, 1], [1, 0] ] ]
+            
+            oldWih = r.getP("W_in_to_hid").getValue()
+            oldWhh = r.getP("W_hid_to_hid").getValue()
+            for x in xrange(1,100):
+                net["out"].train({"inp.inputs": inputs, "out.targets":[1, 1, 1]} )["out.drive.train"]
+            self.assertTrue(oldWih.mean() != r.getP("W_in_to_hid").getValue().mean() )
+            self.assertTrue(oldWhh.mean() != r.getP("W_hid_to_hid").getValue().mean() )
+    
 if __name__ == '__main__' :
     import Mariana.settings as MSET
     MSET.VERBOSE = False
