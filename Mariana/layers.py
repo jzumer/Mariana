@@ -13,7 +13,7 @@ import Mariana.network as MNET
 import Mariana.wrappers as MWRAP
 import Mariana.candies as MCAN
 
-__all__=["Layer_ABC", "WeightBiasOutput_ABC", "WeightBias_ABC", "Output_ABC", "Input", "Hidden", "Composite", "Embedding", "SoftmaxClassifier", "Regression", "Autoencode"]
+__all__=["Layer_ABC", "WeightBiasOutput_ABC", "WeightBias_ABC", "Output_ABC", "Input", "Hidden", "Composite", "Embedding", "SoftmaxClassifier", "Regression", "Autoencode", "GaussianSampling"]
 
 class Layer_ABC(object) :
     "The interface that every layer should expose"
@@ -768,3 +768,59 @@ class Autoencode(WeightBiasOutput_ABC) :
         super(Autoencode, self)._setCustomTheanoFunctions()
         self.train=MWRAP.TheanoFunction("train", self, [("score", self.cost)], {}, updates=self.updates, allow_input_downcast=True)
         self.test=MWRAP.TheanoFunction("test", self, [("score", self.testCost)], {}, allow_input_downcast=True)
+
+class GaussianSampling(Layer_ABC):
+    """
+        Given a vector V of length 2N, samples S times from N(V[:N], V[N:]) and
+            returns the average of the S samples.
+        if samples <= 0, returns V[:N] (infinite averaged samples) instead.
+    
+        `size`: int - value of N above
+        `samples`: int - how many samples to average (S above)
+        `rng`: int - seed to initialize the rng with
+        `name`: str - layer name
+    """
+
+    def __init__(self, size, samples=1, rng=None, name=None, **kwargs):
+        super(GaussianSampling, self).__init__(name=name, initializations=[], **kwargs)
+        self.size = int(size)
+        self.samples = int(samples)
+        self.rng = tt.shared_randomstreams.RandomStreams(rng if rng is not None else 0)
+        self.setHP('shape', (None, self.size))
+
+    def setOutputs_abs(self):
+        layer = self.network.getInConnections(self)[0]
+        for s in self.inputs.streams:
+            mu, logsigma = tt.split(self.inputs[s], [self.size, self.size], 2, axis=1)
+            self.outputs[s] = 0
+            if self.samples > 0:
+                for k in xrange(self.samples):
+                    self.outputs[s] += mu + tt.exp(logsigma) * self.rng.normal(size=mu.shape)
+
+                self.outputs[s] /= self.samples
+            else:
+                self.outputs[s] = mu
+
+    def setShape_abs(self):
+        layer = self.network.getInConnections(self)[0]
+        if layer.getShape_abs():
+            self.originalInputShape = tuple(layer.getShape_abs())
+            if len(self.originalInputShape) > 2:
+                s = 1
+                for v in self.originalInputShape[1:]:
+                    if v is not None:
+                        s *= v
+
+                self.inputShape = (-1, s)
+            else:
+                self.inputShape = self.originalInputShape
+
+    def femaleConnect(self, layer):
+        self.setShape_abs()
+
+    def getShape_abs(self):
+        """defines the number of inputs"""
+        return self.getHP('shape')
+
+    def getParameterShape_abs(self, param, **kwargs):
+        raise ValueError('Layer has no parameters')
